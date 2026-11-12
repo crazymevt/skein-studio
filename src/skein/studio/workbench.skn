@@ -40,8 +40,11 @@ commands here are what its menus do, and what tests call.
 the workbench was made with is no longer the one in use: its widgets belong to that
 backend, and a test may have gone on to another. Returns the timer, or nil."
   [wb seconds f]
-  (when (identical? (:backend wb) (ui/current-backend))
-    (ui/after seconds f)))
+  (let [ours (fn [] (identical? (:backend wb) (ui/current-backend)))]
+    ;; and again when it fires: GTK on macOS runs on AppKit's run loop, where a Cocoa
+    ;; workbench's timer can fire after a test has gone on to GTK
+    (when (ours)
+      (ui/after seconds (fn [] (when (ours) (f)))))))
 
 (defn folder
   "The workbench's folder, or nil."

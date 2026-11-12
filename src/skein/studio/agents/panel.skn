@@ -1,11 +1,13 @@
 (ns skein.studio.agents.panel
-  "The agent panel (Skein's M3.8 step 4, D-110), Lisp Studio's on skein-ui: Claude Code
-and Codex at its top with their model, effort and autonomy; the chat in rich text, replies
-streaming in as Markdown, with the agents' tool activity; approvals and questions as
-buttons; the account's usage limits; and the composer, which sends the message (with the
-open file and the selection as context, and attached files) or, while a turn runs, adds it
-to the turn. It sits on the right of the editors (View ▸ Agent, Primary+J); install!
-puts it in a workbench.
+  "The agent panel (Skein's M3.8 step 4, D-110; drawn as Xeon Studio's chat in M3.9 step
+4, D-115): Claude Code and Codex at its top as chips, with their model, effort and
+autonomy; the conversation as a column of rows, each a widget of its own (your messages in
+a bubble, an agent's replies streaming in as Markdown under its avatar, its tools as cards
+that open on their output, notices as a line); approvals and questions as cards over the
+composer; and the composer, a rounded box with the context as chips, the usage limits as
+badges and Send, which sends the message (with the open file and the selection as
+context, and attached files) or, while a turn runs, adds it to the turn. It sits on the
+right of the editors (View ▸ Agent, Primary+J); install! puts it in a workbench.
 
 The adapters' events come on their fibers and are handed to the UI's thread, where
 everything here runs."
@@ -21,11 +23,12 @@ everything here runs."
             [skein.studio.agents :as agents]
             [skein.studio.agents.claude :as claude]
             [skein.studio.agents.codex :as codex]
-            [skein.studio.agents.tools :as tools]))
+            [skein.studio.agents.tools :as tools]
+            [skein.studio.icons :as icons]
+            [skein.time :as time]))
 
 (def agent-ids "The agents, in the order they're offered." ["claude" "codex"])
 
-(defn- agent-index [id] (or (first (keep-indexed (fn [i x] (when (= x id) i)) agent-ids)) 0))
 
 (defn agent-label [id] (if (= id "codex") "Codex" "Claude"))
 
@@ -39,7 +42,7 @@ everything here runs."
 
 (defmethod ui/measure [(v composer-view)]
   ;; a code view measures 200 tall; the composer is a few lines, the chat gets the rest
-  [300 72])
+  [300 48])
 
 (defmethod ui/handle-event :around [(v composer-view) (e ui/key-event)]
   (if (and (= :key-down (:signal e)) (not (ui/consumed? e)) (= :return (:key e))
@@ -129,15 +132,258 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
   (let [bs (entry-blocks e)]
     (if (= :reply (:kind e)) (code-actions bs i) bs)))
 
+(def ^:private link-activated!
+  "Follow a link in a reply (defined with the panel, below).")
+
+;;; The look: avatars, rows and cards
+
+(def ^:private agent-colors {"claude" "#D97757" "codex" "#3E9E7A"})
+
+(def ^:private status-colors
+  {:idle :system-green :busy :system-orange :starting :system-orange :error :system-red})
+
+(defn- clock
+  "The local time now, as 10:26 AM."
+  []
+  (let [{:keys [hour minute]} (time/local-time)
+        h (mod hour 12)]
+    (format "%d:%02d %s" (if (zero? h) 12 h) minute (if (< hour 12) "AM" "PM"))))
+
+(defn- avatar
+  "A round avatar of letter on color, size points across; with status (an atom of an
+agent's state, or nil), a dot at its corner showing it."
+  ([letter color size] (avatar letter color size nil))
+  ([letter color size status]
+   (ui/canvas {:width size :height size :hexpand false :vexpand false :valign :start
+               :focusable false
+               :on-draw (fn [e]
+                          (let [gc (:context e)
+                                r (/ size 2)]
+                            (ui/fill-circle! gc r r r {:color color})
+                            (ui/draw-text! gc letter r r {:color :white :align :center
+                                                          :valign :center
+                                                          :font {:weight :bold
+                                                                 :size (* size 0.45)}})
+                            (when-let [s (when status @status)]
+                              (ui/fill-circle! gc (- size 3.5) (- size 3.5) 4.5
+                                               {:color :window-background})
+                              (ui/fill-circle! gc (- size 3.5) (- size 3.5) 3
+                                               {:color (get status-colors s
+                                                            :secondary-text)}))))})))
+
+(defn- dot
+  "A small round dot in the color an atom holds."
+  [color]
+  (ui/canvas {:width 8 :height 8 :hexpand false :vexpand false :valign :center
+              :focusable false
+              :on-draw (fn [e] (ui/fill-circle! (:context e) 4 4 4 {:color @color}))}))
+
+(defn- icon-view
+  "An image view of the icon k, size points, in color (a template in the text's)."
+  ([k size] (ui/image-view {:image (icons/icon k {:size size}) :hexpand false :vexpand false}))
+  ([k size color]
+   (ui/image-view {:image (icons/icon k {:size size :color color}) :hexpand false
+                   :vexpand false})))
+
+(defn- small [opts] (merge {:font {:size 11} :text-color :secondary-text} opts))
+
+;; A wrapping label here has a :width of 120: its natural width, which a long line would
+;; otherwise make the panel's, so it wraps at the width the pane gives instead.
+
+(defn- time-label [] (ui/label (small {:text (clock) :user-data :time})))
+
+(defn- header-line
+  "A message's first line: who (in color, if given) and when."
+  [who color]
+  (ui/hbox {:spacing 8}
+           (ui/label {:text who :font {:weight :semibold}
+                      :text-color (or color :text)})
+           (time-label)))
+
+(defn- chip
+  "A small rounded label with an icon: on (a tint of the accent) or off."
+  [k text on opts]
+  (apply ui/hbox (merge {:spacing 4 :padding [2 8] :corner-radius 6
+                         :background (if on [:accent 0.15] :control-background)
+                         :border-color (if on [:accent 0.5] :separator)}
+                        opts)
+         [(icon-view k 12) (ui/label {:text text :font {:size 11}})]))
+
+(defn- user-row [e]
+  (let [labels (concat (:context e) (map io/file-name (:files e)))]
+    (ui/hbox {:spacing 10}
+             (avatar "Y" :accent 26)
+             (apply ui/vbox {:spacing 4 :hexpand true}
+                    (header-line "You" nil)
+                    (ui/hbox {}
+                             (ui/vbox {:padding [8 12] :corner-radius 10 :hexpand true
+                                       :background :control-background :border-color :separator}
+                                      (ui/label {:text (str (:text e)) :wrap true :width 120
+                                                 :selectable true})))
+                    (when (seq labels)
+                      [(apply ui/hbox {:spacing 6}
+                              (map (fn [l] (chip :file l false {})) labels))])))))
+
+(defn- agent-row
+  "An agent's turn: its avatar, its name and the time; the body its replies and tools go
+in. Returns [row body]."
+  [e]
+  (let [id (:agent e)
+        body (ui/vbox {:spacing 8 :hexpand true}
+                      (header-line (agent-label id) (get agent-colors id)))]
+    [(ui/hbox {:spacing 10}
+              (avatar (subs (agent-label id) 0 1) (get agent-colors id "#808080") 26)
+              body)
+     body]))
+
+(defn- reply-view [p e i]
+  (let [r (ui/rich-text {:fit-height true :content (blocks-of e i)
+                         :on-link-activated (fn [ev] (link-activated! p (:href ev)))})]
+    {:widget r :update (fn [e] (set-slot! r :content (blocks-of e i)))}))
+
+(defn- output-lines [output]
+  (let [ls (string/split-lines (str output))]
+    (string/join "\n" (concat (take 40 ls) (when (> (count ls) 40) ["…"])))))
+
+(defn- activity-view
+  "A tool's card: a dot for its state, its name and detail; a click opens its output."
+  [e]
+  (let [color (atom :secondary-text)
+        d (dot color)
+        label (ui/label {:text "" :font {:weight :semibold}})
+        detail (ui/label {:text "" :font {:family :monospace :size 11}
+                          :text-color :secondary-text :hexpand true})
+        output (ui/label {:text "" :font {:family :monospace :size 11} :wrap true :width 120
+                          :selectable true :text-color :secondary-text :visible false})
+        card (ui/vbox {:clickable true :padding [6 10] :spacing 6 :corner-radius 8
+                       :background :control-background :border-color :separator
+                       :hover-border-color :secondary-text
+                       :on-clicked (fn [_] (when (seq (:text output))
+                                             (set-slot! output :visible (not (:visible output)))))}
+                      (ui/hbox {:spacing 8} d label detail)
+                      output)
+        update (fn [e]
+                 (reset! color (case (:state e) :done :system-green :failed :system-red
+                                     :system-orange))
+                 (ui/redraw! d)
+                 (set-slot! label :text (str (:label e)))
+                 (set-slot! detail :text (agents/truncate (str (:detail e)) 200))
+                 (set-slot! output :text (output-lines (:output e)))
+                 ;; a failure shows what it said
+                 (when (and (= :failed (:state e)) (seq (:output e)))
+                   (set-slot! output :visible true)))]
+    (update e)
+    {:widget card :update update}))
+
+(defn- rule [] (ui/vbox {:height 1 :width 24 :valign :center :background :separator}))
+
+(defn- notice-view [e]
+  (ui/hbox {:spacing 10}
+           (rule)
+           (ui/label (small {:text (str (:text e)) :wrap true :width 120 :hexpand true
+                             :alignment :center
+                             :text-color (if (:error e) :system-red :secondary-text)}))
+           (rule)))
+
+(def ^:private suggestions
+  [["Explain this file" "What does the active file do?"
+    "Explain what the active file does, briefly."]
+   ["Find problems" "Look for bugs in the active file"
+    "Review the active file for bugs, and suggest fixes."]
+   ["Write tests" "Add tests for the code in the active file"
+    (str "Write tests for the functions in the active file, following the project's test "
+         "setup (skein.test), and run them with skein_eval.")]
+   ["Try it in the REPL" "Load the active file and exercise its code"
+    "Load the active file in the REPL with skein_eval and try its main functions."]])
+
+(def ask!
+  "Send text to the agent shown (defined below).")
+
+(defn- welcome-view [p]
+  (apply ui/vbox {:padding [36 12 12 12] :spacing 12}
+         (ui/vbox {:background [:accent 0.15] :corner-radius 14 :width 52 :height 52
+                   :halign :center}
+                  (ui/image-view {:image (icons/icon :sparkle {:size 26 :color :accent})
+                                  :hexpand false :vexpand false :halign :center
+                                  :valign :center :margin [13 0 0 0]}))
+         (ui/label {:text "Work with an agent" :alignment :center :halign :center
+                    :font {:size 16 :weight :semibold}})
+         (ui/label (small {:text (str "It reads and edits your files and uses the REPL, the "
+                                      "debugger and the problems; what it does asks first "
+                                      "as Autonomy says.")
+                           :wrap true :width 120 :alignment :center :font {:size 12}}))
+         (for [[title sub prompt] suggestions]
+           (ui/vbox {:clickable true :padding [9 12] :spacing 2 :corner-radius 10
+                     :background :control-background :border-color :separator
+                     :hover-border-color :accent
+                     :on-clicked (fn [_] (ask! p prompt))}
+                    (ui/label {:text title :font {:weight :semibold}})
+                    (ui/label (small {:text sub :wrap true :width 120}))))))
+
+;;; The timeline: a widget per entry, made once and updated as its entry changes
+
+(defn- clear-timeline! [p]
+  (let [t (:timeline p)]
+    (doseq [c (vec (:children t))]
+      (ui/remove! t c)
+      (ui/destroy! c))))
+
+(defn- show-welcome! [p]
+  (clear-timeline! p)
+  (ui/add! (:timeline p) (welcome-view p))
+  (swap! (:state p) assoc :views [] :group nil :welcome true))
+
+(defn- add-row! [p w]
+  (when (:welcome (st p))
+    (clear-timeline! p)
+    (swap! (:state p) assoc :welcome false))
+  (ui/add! (:timeline p) w))
+
+(defn- make-view!
+  "Make entry e's widget, put it where it goes, and return its view: {:entry :update}."
+  [p e i]
+  (let [in-turn (fn [w]
+                  ;; an agent's replies and tools go in its turn; without one, indented
+                  (if-let [body (:group (st p))]
+                    (ui/add! body w)
+                    (add-row! p (ui/vbox {:margin [0 0 0 36]} w))))]
+    (case (:kind e)
+      :user (do (add-row! p (user-row e))
+                (swap! (:state p) assoc :group nil)
+                {:entry e :update (fn [_])})
+      :agent (let [[row body] (agent-row e)]
+               (add-row! p row)
+               (swap! (:state p) assoc :group body)
+               {:entry e :update (fn [_])})
+      :reply (let [v (reply-view p e i)] (in-turn (:widget v)) (assoc v :entry e))
+      :activity (let [v (activity-view e)] (in-turn (:widget v)) (assoc v :entry e))
+      :notice (do (add-row! p (notice-view e))
+                  (swap! (:state p) assoc :group nil)
+                  {:entry e :update (fn [_])})
+      {:entry e :update (fn [_])})))
+
+(defn- refresh-thinking! [p]
+  (let [{:keys [entries status active]} (st p)
+        last-kind (:kind (peek entries))]
+    ;; busy, and nothing of the reply yet
+    (set-slot! (:thinking p) :visible
+               (boolean (and (= :busy (get status active)) (= :agent last-kind))))))
+
+(defn- scroll-to-end! [p]
+  (wb/later! (:w p) 0 (fn [] (ui/scroll-to! (:scroller p) 0 100000000))))
+
 (defn- render! [p]
   (swap! (:state p) assoc :render-pending false)
-  (let [entries (vec (map-indexed (fn [i e] (if (contains? e :blocks)
-                                              e
-                                              (assoc e :blocks (blocks-of e i))))
-                                  (:entries (st p))))]
-    (swap! (:state p) assoc :entries entries)
-    (set-slot! (:chat p) :content (vec (mapcat :blocks entries)))
-    (ui/scroll-to-position! (:chat p) (ui/text-length (:chat p)))))
+  (let [entries (:entries (st p))]
+    (doseq [i (range (count entries))]
+      (let [e (nth entries i)
+            v (get (:views (st p)) i)]
+        (cond (nil? v) (let [v (make-view! p e i)]
+                         (swap! (:state p) update :views conj v))
+              (not= e (:entry v)) (do ((:update v) e)
+                                      (swap! (:state p) assoc-in [:views i :entry] e)))))
+    (refresh-thinking! p)
+    (scroll-to-end! p)))
 
 (defn- schedule-render!
   "Render the chat soon: deltas that come close together are rendered once."
@@ -159,7 +405,7 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
                                                                 (= item (:item e)))
                                                        i))
                                            es))]
-             (assoc es i (dissoc (f (nth es i)) :blocks))
+             (assoc es i (f (nth es i)))
              (conj es (f nil)))))
   (schedule-render! p))
 
@@ -168,14 +414,64 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
   ([p text] (notice! p text false))
   ([p text error] (add-entry! p {:kind :notice :text text :error error})))
 
-(defn chat-text
-  "The chat's text, as it shows."
+(defn entries
+  "The chat's entries, oldest first: maps of :kind (:user, :agent, :reply, :activity or
+:notice) and what each has."
   [p]
-  (ui/code-text (:chat p)))
+  (:entries (st p)))
+
+(defn reply-links
+  "The links in the replies, in order: [start end href] each."
+  [p]
+  (let [rich (fn rich [w] (if (instance? ui/rich-text-widget w)
+                            [w]
+                            (mapcat rich (or (:children w) []))))]
+    (vec (mapcat :links (rich (:timeline p))))))
+
+(defn chat-text
+  "The chat's text, as it shows (without the times): its labels' and replies' text, one
+to a line."
+  [p]
+  (let [texts (fn texts [w]
+                (cond (:welcome (st p)) []
+                      (instance? ui/rich-text-widget w) [(ui/code-text w)]
+                      (instance? ui/label-widget w) (if (or (= :time (:user-data w))
+                                                            (not (:visible w)))
+                                                      []
+                                                      [(:text w)])
+                      :else (mapcat texts (or (:children w) []))))]
+    (string/join "\n" (remove string/blank? (texts (:timeline p))))))
 
 ;;; The header
 
 (defn- active [p] (:active (st p)))
+
+(defn limits-text
+  "The agent shown's usage limits as words: \"5h 75% left\"."
+  [p]
+  (string/join " · " (map (fn [w] (str (:label w) " "
+                                       (if (:remaining w) (str (:remaining w) "% left")
+                                           (or (:state w) ""))))
+                          (get (:limits (st p)) (active p)))))
+
+(defn- limit-badge [w]
+  (let [r (:remaining w)
+        tint (cond (nil? r) :secondary-text (> r 50) :system-green (> r 20) :system-orange
+                   :else :system-red)]
+    (ui/hbox {:padding [1 6] :corner-radius 5 :background [tint 0.18]
+              :tooltip (str (:label w) ": " (if r (str r "% left") (or (:state w) "")))}
+             (ui/label {:text (string/upper-case (str (:label w) (when r (str " " r "%"))))
+                        :font {:size 10 :weight :semibold} :text-color tint}))))
+
+(defn- refresh-chips! [p]
+  (let [{:keys [status]} (st p)
+        id (active p)]
+    (doseq [[aid {:keys [card status-atom avatar]}] (:chips p)]
+      (let [on (= aid id)]
+        (set-slot! card :background (if on [:accent 0.15] nil))
+        (set-slot! card :border-color (if on :accent :separator))
+        (reset! status-atom (get status aid))
+        (ui/redraw! avatar)))))
 
 (defn- refresh-header! [p]
   (let [{:keys [status models limits]} (st p)
@@ -185,7 +481,8 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
         efforts (or (:efforts (first (filter (fn [m] (= model (:id m))) ms)))
                     (some :efforts (filter :default ms))
                     [])
-        windows (get limits id)]
+        busy (= :busy (get status id))]
+    (refresh-chips! p)
     (set-slot! (:status-label p) :text (name (or (get status id) :stopped)))
     (set-slot! (:model-box p) :items (into ["Default model"] (map :label ms)))
     (set-slot! (:model-box p) :selected-index
@@ -195,12 +492,11 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
                (or (first (keep-indexed (fn [i e] (when (= (choice id :effort) e) (inc i)))
                                         efforts))
                    0))
-    (set-slot! (:limits-label p) :text
-               (string/join " · " (map (fn [w] (str (:label w) " "
-                                                    (if (:remaining w) (str (:remaining w) "% left")
-                                                        (or (:state w) ""))))
-                                       windows)))
-    (set-slot! (:stop-button p) :enabled (= :busy (get status id)))))
+    (let [box (:limits-box p)]
+      (doseq [c (vec (:children box))] (ui/remove! box c) (ui/destroy! c))
+      (doseq [w (get limits id)] (ui/add! box (limit-badge w))))
+    (set-slot! (:stop-button p) :visible busy)
+    (when (:thinking p) (refresh-thinking! p))))
 
 ;;; Requests: approvals and questions, as buttons under the chat
 
@@ -230,22 +526,41 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
                                    :on-clicked (fn [_]
                                                  (swap! answers assoc qid (:label o)))})))]))))
 
+(def ^:private request-card
+  {:padding [10 12] :spacing 8 :corner-radius 10 :background [:accent 0.12]
+   :border-color :accent})
+
+(defn- request-title [id request]
+  (ui/hbox {:spacing 8}
+           (icon-view :problems 14 :accent)
+           (ui/label {:text (str (agent-label id) ": " (:title request)) :wrap true :width 120
+                      :hexpand true :font {:weight :semibold}})))
+
 (defn- request-widget [p id request]
   (let [answers (atom {})]
     (case (:kind request)
       :question
-      (apply ui/vbox {:padding 6 :spacing 6 :surface :status}
-             (ui/label {:text (str (agent-label id) ": " (:title request))})
+      (apply ui/vbox request-card
+             (request-title id request)
              (concat (for [q (:questions request)] (question-widget p id request q answers))
-                     [(ui/button {:label "Answer"
-                                  :on-clicked (fn [_] (answer! p id request :allow @answers))})]))
-      (ui/vbox {:padding 6 :spacing 6 :surface :status}
-        (ui/label {:text (str (agent-label id) ": " (:title request))})
-        (ui/label {:text (str (:detail request)) :wrap true})
-        (apply ui/hbox {:spacing 6}
-               (for [o (:options request)]
-                 (ui/button {:label (:label o)
-                             :on-clicked (fn [_] (answer! p id request (:value o) nil))})))))))
+                     [(ui/hbox {}
+                               (ui/button {:label "Answer"
+                                           :on-clicked (fn [_]
+                                                         (answer! p id request :allow
+                                                                  @answers))}))]))
+      (apply ui/vbox request-card
+             (request-title id request)
+             (concat
+              (when (seq (str (:detail request)))
+                [(ui/label {:text (agents/truncate (str (:detail request)) 4000)
+                            :wrap true :width 120
+                            :selectable true :font {:family :monospace :size 11}
+                            :text-color :secondary-text})])
+              [(apply ui/hbox {:spacing 6}
+                      (for [o (:options request)]
+                        (ui/button {:label (:label o)
+                                    :on-clicked (fn [_] (answer! p id request (:value o)
+                                                                 nil))})))])))))
 
 (defn- refresh-requests! [p]
   (let [rs (:requests (st p))
@@ -267,7 +582,8 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
 (defn- exited! [p id e]
   (let [a (adapter-of p id)]
     ;; A restart (another model) ends the old CLI once the new one runs: that one stays.
-    (when-not (and a (agents/cli-alive? (agents/state a :cli)))
+    ;; One the panel let go of (New Chat, another program) was stopped on purpose.
+    (when (and a (not (agents/cli-alive? (agents/state a :cli))))
       (swap! (:state p) (fn [s] (-> s
                                     (update :adapters dissoc id)
                                     (assoc-in [:status id] :stopped))))
@@ -374,10 +690,14 @@ next start, stopping the one running: a stand-in, say."
   "Click the panel's button labelled label (Send, Stop, or one of a request's), as the
 user would; false if there is none."
   [p label]
-  (let [buttons (fn buttons [w] (if (instance? ui/button-widget w)
-                                  [w]
-                                  (mapcat buttons (or (:children w) []))))]
-    (if-let [b (first (filter (fn [b] (= label (:label b))) (buttons (:widget p))))]
+  (let [buttons (fn buttons [w] (concat (when (or (instance? ui/button-widget w)
+                                                   (and (instance? ui/container-widget w)
+                                                        (:clickable w)))
+                                           [w])
+                                         (mapcat buttons (or (:children w) []))))
+        named (fn [b] (or (:label b) (:label (:user-data b))))]
+    (if-let [b (first (filter (fn [b] (and (:visible b) (= label (named b))))
+                              (buttons (:widget p))))]
       (do (ui/emit! b (ui/event-for b :clicked)) true)
       false)))
 
@@ -386,7 +706,6 @@ user would; false if there is none."
   [p id]
   (swap! (:state p) assoc :active id)
   (settings/set-setting! :agent id)
-  (set-slot! (:agent-box p) :selected-index (agent-index id))
   (refresh-header! p)
   (ensure-agent! p id))
 
@@ -420,8 +739,8 @@ user would; false if there is none."
   [p autonomy]
   (settings/set-setting! :agent-autonomy autonomy)
   (doseq [[_ a] (:adapters (st p))] (agents/set-autonomy! a autonomy))
-  (notice! p (str (second (first (filter (fn [[k _]] (= k autonomy)) autonomies)))
-                  " from the next start of a conversation.")))
+  (notice! p (str "Autonomy: " (second (first (filter (fn [[k _]] (= k autonomy)) autonomies)))
+                  ", from the next conversation")))
 
 (defn new-chat!
   "Stop the agents and forget their conversations: the next message starts a new one."
@@ -433,9 +752,31 @@ user would; false if there is none."
   (swap! (:state p) assoc :adapters {} :status {} :entries [] :requests {})
   (refresh-requests! p)
   (refresh-header! p)
-  (render! p))
+  (show-welcome! p))
 
 ;;; Sending
+
+(defn- refresh-chips-row!
+  "The composer's chips: the open file and the selection (a click leaves either out of
+the message, or puts it back), and the attached files (a click takes one off)."
+  [p]
+  (let [row (:chips-row p)
+        {:keys [include-file include-selection attachments]} (st p)
+        toggle (fn [k] (fn [_] (swap! (:state p) update k not) (refresh-chips-row! p)))]
+    (doseq [c (vec (:children row))] (ui/remove! row c) (ui/destroy! c))
+    (ui/add! row (chip :file "Open file" include-file
+                       {:clickable true :tooltip "Send where you are in the open file"
+                        :on-clicked (toggle :include-file)}))
+    (ui/add! row (chip :code "Selection" include-selection
+                       {:clickable true :tooltip "Send the selected text"
+                        :on-clicked (toggle :include-selection)}))
+    (doseq [f attachments]
+      (ui/add! row (chip :close (io/file-name f) false
+                         {:clickable true :tooltip (str f " (click to take it off)")
+                          :on-clicked (fn [_]
+                                        (swap! (:state p) update :attachments
+                                               (fn [xs] (vec (remove #{f} xs))))
+                                        (refresh-chips-row! p))})))))
 
 (defn context
   "What the message says of where the user is, and its labels for the chat:
@@ -486,7 +827,7 @@ the turn under way."
      (when (or (not (string/blank? text)) (seq files))
        (let [id (active p)]
          (when-let [a (ensure-agent! p id)]
-           (let [[ctx labels] (context p (:checked (:file-box p)) (:checked (:selection-box p)))
+           (let [[ctx labels] (context p (:include-file (st p)) (:include-selection (st p)))
                  images (agents/sendable-images files)
                  message (str (if (and (string/blank? text) (seq files))
                                 "See the attached files."
@@ -496,18 +837,22 @@ the turn under way."
              (add-entry! p {:kind :user :text text :context labels :files files})
              (add-entry! p {:kind :agent :agent id})
              (swap! (:state p) assoc :attachments [])
-             (set-slot! (:attachments-label p) :text "")
+             (refresh-chips-row! p)
              (ui/set-buffer-text! (:buffer (:composer p)) "")
              (if (= :busy (get-in (st p) [:status id]))
                (agents/steer! a message images)
                (agents/send! a message images)))))))))
 
+(defn attachments
+  "The files attached to the next message."
+  [p]
+  (:attachments (st p)))
+
 (defn attach!
   "Attach files (paths) to the next message."
   [p files]
   (swap! (:state p) update :attachments (fn [xs] (vec (distinct (concat xs files)))))
-  (set-slot! (:attachments-label p) :text
-             (string/join ", " (map io/file-name (:attachments (st p))))))
+  (refresh-chips-row! p))
 
 (defn stop!
   "Stop the turn under way."
@@ -554,6 +899,22 @@ REPL (action \"copy\", \"insert\" or \"run\")."
     (code-action! p action (parse-long i) (parse-long k))
     (open-link! p href)))
 
+(defn- agent-chip [p-ref id]
+  (let [status (atom nil)
+        a (avatar (subs (agent-label id) 0 1) (get agent-colors id) 20 status)
+        card (ui/hbox {:clickable true :spacing 6 :padding [3 10 3 4] :corner-radius 14
+                       :border-color :separator :hover-border-color :accent
+                       :user-data {:label (agent-label id)}
+                       :on-clicked (fn [_] (when-let [p @p-ref] (select-agent! p id)))}
+                      a (ui/label {:text (agent-label id) :valign :center}))]
+    {:card card :status-atom status :avatar a}))
+
+(defn- send-pill [on-click]
+  (ui/hbox {:clickable true :spacing 6 :padding [5 12] :corner-radius 8 :background :accent
+            :hover-background [:accent 0.8] :user-data {:label "Send"} :on-clicked on-click}
+           (icon-view :send 14 :white)
+           (ui/label {:text "Send" :text-color :white :font {:weight :semibold}})))
+
 (defn make-panel
   "The agent panel of the workbench w. opts: :programs, {agent-id program}, for CLIs other
 than the installed ones (tests give stand-ins)."
@@ -561,20 +922,20 @@ than the installed ones (tests give stand-ins)."
   ([w opts]
    (let [p-ref (atom nil)
          later (fn [f] (fn [e] (when-let [p @p-ref] (f p e))))
-         agent-box (ui/combo-box {:items (mapv agent-label agent-ids)
-                                  :on-changed (later (fn [p e]
-                                                       (when-let [i (:index e)]
-                                                         (select-agent! p (nth agent-ids i)))))})
-         status-label (ui/label {:text "stopped"})
-         new-chat (ui/button {:label "New Chat" :on-clicked (later (fn [p _] (new-chat! p)))})
-         model-box (ui/combo-box {:items ["Default model"] :selected-index 0
-                                  :on-changed (later (fn [p e] (when-let [i (:index e)]
-                                                                 (model-chosen! p i))))})
-         effort-box (ui/combo-box {:items ["Default effort"] :selected-index 0
-                                   :on-changed (later (fn [p e] (when-let [i (:index e)]
-                                                                  (effort-chosen! p i))))})
-         autonomy-box (ui/combo-box
+         chips (into {} (map (fn [id] [id (agent-chip p-ref id)]) agent-ids))
+         status-label (ui/label (small {:text "stopped" :valign :center}))
+         new-chat (ui/button {:image (icons/icon :plus) :style :icon :tooltip "New chat"
+                              :on-clicked (later (fn [p _] (new-chat! p)))})
+         combo (fn [o] (ui/combo-box (merge {:control-size :small :hexpand true} o)))
+         model-box (combo {:items ["Default model"] :selected-index 0
+                           :on-changed (later (fn [p e] (when-let [i (:index e)]
+                                                          (model-chosen! p i))))})
+         effort-box (combo {:items ["Default effort"] :selected-index 0
+                            :on-changed (later (fn [p e] (when-let [i (:index e)]
+                                                           (effort-chosen! p i))))})
+         autonomy-box (combo
                        {:items (mapv second autonomies)
+                        :tooltip "What the agent may do without asking"
                         :selected-index (or (first (keep-indexed
                                                     (fn [i [k _]]
                                                       (when (= k (settings/setting :agent-autonomy))
@@ -584,45 +945,62 @@ than the installed ones (tests give stand-ins)."
                         :on-changed (later (fn [p e]
                                              (when-let [i (:index e)]
                                                (set-autonomy! p (first (nth autonomies i))))))})
-         limits-label (ui/label {:text ""})
-         chat (ui/rich-text {:vexpand true
-                             :on-link-activated (later (fn [p e] (link-activated! p (:href e))))})
-         requests-box (ui/vbox {:spacing 6 :visible false})
-         file-box (ui/check-box {:label "Open file" :checked true})
-         selection-box (ui/check-box {:label "Selection" :checked true})
-         attachments-label (ui/label {:text ""})
+         header (apply ui/vbox {:padding [8 10] :spacing 7}
+                       [(apply ui/hbox {:spacing 6}
+                               (concat [(icon-view :sparkle 16 :accent)]
+                                       (map (fn [id] (:card (get chips id))) agent-ids)
+                                       [(ui/box {:hexpand true}) status-label new-chat]))
+                        (ui/hbox {:spacing 6} model-box effort-box autonomy-box)])
+         timeline (ui/vbox {:padding [14 14 6 14] :spacing 16})
+         thinking (ui/label (small {:text "Thinking…" :margin [0 0 8 50] :visible false}))
+         scroller (ui/scrolled-window {:horizontal-policy :never :vexpand true}
+                                      (ui/vbox {:spacing 0} timeline thinking))
+         requests-box (ui/vbox {:spacing 8 :padding [0 12 8 12] :visible false})
+         chips-row (ui/hbox {:spacing 6})
          choose (fn [p _]
                   (when-let [fs (ui/choose-file {:title "Attach Files" :multiple true
                                                  :parent (:window w) :directory (wb/folder w)})]
                     (attach! p (if (string? fs) [fs] fs))))
-         attach (ui/button {:label "Attach…" :on-clicked (later choose)})
+         attach (ui/button {:image (icons/icon :plus) :style :icon :tooltip "Attach files…"
+                            :on-clicked (later choose)})
          composer (ui/build composer-view {:vexpand false :wrap true :line-numbers false
-                                           :placeholder "Ask the agent… (Return sends)"}
+                                           :palette {:background :control-background}
+                                           :font {:family :system :size 13}
+                                           :placeholder (str "Ask the agent… (it can run "
+                                                             "code in your REPL)")}
                             nil)
-         send-button (ui/button {:label "Send" :on-clicked (later (fn [p _] (send! p)))})
-         stop-button (ui/button {:label "Stop" :enabled false
-                                 :on-clicked (later (fn [p _] (stop! p)))})
-         widget (ui/vbox {:padding 8 :spacing 6 :vexpand true}
-                  (ui/hbox {:spacing 6} agent-box status-label (ui/box {:hexpand true}) new-chat)
-                  (ui/hbox {:spacing 6} model-box effort-box autonomy-box)
-                  limits-label
-                  chat
+         limits-box (ui/hbox {:spacing 4 :valign :center})
+         send-button (send-pill (later (fn [p _] (send! p))))
+         stop-button (ui/button {:image (icons/icon :stop) :style :icon :tooltip "Stop the turn"
+                                 :visible false :on-clicked (later (fn [p _] (stop! p)))})
+         box (ui/vbox {:padding [8 6 6 6] :spacing 4 :corner-radius 12
+                       :background :control-background :border-color :separator}
+                      (ui/hbox {:padding [0 6]} chips-row)
+                      composer
+                      (ui/hbox {:spacing 6 :padding [0 4 0 8]}
+                               (ui/label (small {:text "Return sends · Shift+Return, a new line"
+                                                 :hexpand true :valign :center}))
+                               limits-box attach stop-button send-button))
+         widget (ui/vbox {:spacing 0 :vexpand true}
+                  header
+                  (ui/separator {})
+                  scroller
                   requests-box
-                  (ui/hbox {:spacing 8} file-box selection-box attach attachments-label)
-                  composer
-                  (ui/hbox {:spacing 6} (ui/box {:hexpand true}) stop-button send-button))
+                  (ui/vbox {:padding [4 12 12 12]} box))
          id (let [s (settings/setting :agent)] (if (some #{s} agent-ids) s "claude"))
-         p {:w w :widget widget :chat chat :composer composer :agent-box agent-box
-            :status-label status-label :model-box model-box :effort-box effort-box
-            :autonomy-box autonomy-box :limits-label limits-label :requests-box requests-box
-            :file-box file-box :selection-box selection-box :attachments-label attachments-label
+         p {:w w :widget widget :timeline timeline :thinking thinking :scroller scroller
+            :composer composer :chips chips :status-label status-label :model-box model-box
+            :effort-box effort-box :autonomy-box autonomy-box :limits-box limits-box
+            :requests-box requests-box :chips-row chips-row
             :send-button send-button :stop-button stop-button
             :state (atom {:active id :adapters {} :status {} :models {} :limits {} :usage {}
-                          :entries [] :requests {} :attachments []
+                          :entries [] :views [] :requests {} :attachments []
+                          :include-file true :include-selection true
                           :programs (or (:programs opts) {})})}]
      (reset! p-ref p)
      (set-slot! composer :on-send (fn [] (send! p)))
-     (set-slot! agent-box :selected-index (agent-index id))
+     (show-welcome! p)
+     (refresh-chips-row! p)
      (refresh-header! p)
      p)))
 

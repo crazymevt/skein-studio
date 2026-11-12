@@ -87,8 +87,11 @@
         (wait-for 1 (fn [] false))
         (let [text (panel/chat-text p)]
           (is (string/includes? text "Claude\nHello") text)
-          (is (string/includes? text "▸ Bash ls ✓") text))
-        (is (= "5h 75% left" (:text (:limits-label p))))
+          (is (string/includes? text "Bash\nls") text))
+        (is (some (fn [e] (and (= :activity (:kind e)) (= "Bash" (:label e)) (= :done (:state e))))
+                  (panel/entries p))
+            "the tool's card, done")
+        (is (= "5h 75% left" (panel/limits-text p)))
         (is (= {:context-used 1200 :context-window 200000}
                (get-in @(:state p) [:usage "claude"]))))
       (testing "the conversation is kept, to resume"
@@ -135,7 +138,9 @@
         (let [text (panel/chat-text p)]
           (is (string/includes? text "You\nand briefly") text)
           (is (string/includes? text "Codex\nHello") text)
-          (is (string/includes? text "▸ Command ls ✓") text)))
+          (is (string/includes? text "Command\nls") text)
+          (is (some (fn [e] (and (= "Command" (:label e)) (= :done (:state e))))
+                    (panel/entries p)))))
       (headless/answer! 1 1 1)
       (ui/close! (:window w)))))
 
@@ -158,7 +163,7 @@
         (is (= ["src/app/main.skn" "15 characters selected"] labels)))
       (is (= [nil []] (panel/context p false false)))
       (panel/attach! p ["/tmp/a.png" "/tmp/b.txt"])
-      (is (= "a.png, b.txt" (:text (:attachments-label p)))))
+      (is (= ["a.png" "b.txt"] (mapv io/file-name (panel/attachments p)))))
     (headless/answer! 1 1 1)
     (ui/close! (:window w))))
 
@@ -212,7 +217,7 @@
           (is (string/ends-with? text "ls\nCopy · Insert") (pr-str text)) "no Run for sh")
         (is (= ["skein-studio:copy/0/0" "skein-studio:insert/0/0" "skein-studio:run/0/0"
                 "skein-studio:copy/0/1" "skein-studio:insert/0/1"]
-               (mapv (fn [[_ _ href]] href) (:links (:chat p)))))
+               (mapv (fn [[_ _ href]] href) (panel/reply-links p))))
         (is (= "(add 1 2)\n" (panel/code-block p 0 0)))
         (panel/code-action! p "copy" 0 1)
         (is (= "ls\n" (ui/clipboard-text)))

@@ -147,7 +147,16 @@ called with a line for each step. Returns {:ok true}, or {:ok false :step s :rea
                     (do (when (= :agent (first step))
                           ;; built here, on the script's fiber, not the UI's thread
                           @stand-in)
-                        (on-ui (fn [] (run-step! w step opts)))
+                        (if (= :snapshot (first step))
+                          ;; GTK pictures a frame it has drawn: a window that just
+                          ;; changed may need a few turns of its loop first
+                          (loop [n 0]
+                            (when-let [failed (on-ui (fn [] (try (run-step! w step opts) nil
+                                                                 (catch error e e))))]
+                              (if (>= n 50)
+                                (error (or (ex-message failed) (str failed)))
+                                (do (pump) (recur (inc n))))))
+                          (on-ui (fn [] (run-step! w step opts))))
                         (pump)))
                   nil
                   (catch error e (or (ex-message e) (str e))))]
