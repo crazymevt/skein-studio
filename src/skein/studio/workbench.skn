@@ -418,7 +418,28 @@ Returns true if it closed."
 (defn- running! [wb inf what]
   (swap! (:state wb) assoc :inferior inf)
   (repl/set-prompt! (:repl wb) (str @(:package (:conn inf)) "=> "))
-  (message! wb what))
+  (message! wb what)
+  ;; what was typed at the REPL while it started
+  (let [[old _] (swap-vals! (:state wb) dissoc :repl-pending)]
+    (doseq [text (:repl-pending old)]
+      (swank/listener-eval (:conn inf) text))))
+
+(defn- start-inferior!
+  "Stop the program running, if one is, and run main under skein dev in folder, connecting
+to it; label names it in the status bar."
+  [wb folder main label]
+  (stop-program! wb)
+  (swap! (:state wb) assoc :starting true)
+  (message! wb (str "Starting " label " under skein dev…"))
+  (async! wb (fn [] (inferior/start! folder main
+                                     (fn [line] (on-ui wb append-output! (str line "\n")))
+                                     (fn [e] (on-ui wb handle-swank-event! e))))
+          (fn [r]
+            (swap! (:state wb) dissoc :starting)
+            (if-let [inf (:value r)]
+              (running! wb inf (str "Running " label))
+              (do (swap! (:state wb) dissoc :repl-pending)
+                  (message! wb (str "Couldn't run " label ": " (reason (:error r)))))))))
 
 (defn run-program!
   "Run the folder's project under skein dev (its project.skn's :main), or the active
@@ -430,15 +451,21 @@ Skein file, and connect to it."
                  (when (and active (= "skn" (io/extension active))) active))]
     (if-not main
       (message! wb "Nothing to run: no project.skn with a :main, and no Skein file open")
-      (do (stop-program! wb)
-          (message! wb (str "Starting " (io/file-name main) " under skein dev…"))
-          (async! wb (fn [] (inferior/start! (or f (io/parent main)) main
-                                          (fn [line] (on-ui wb append-output! (str line "\n")))
-                                          (fn [e] (on-ui wb handle-swank-event! e))))
-                  (fn [r] (if-let [inf (:value r)]
-                            (running! wb inf (str "Running " (io/file-name main)))
-                            (message! wb (str "Couldn't run " (io/file-name main) ": "
-                                              (reason (:error r)))))))))))
+      (start-inferior! wb (or f (io/parent main)) main (io/file-name main)))))
+
+(defn start-repl!
+  "Start a REPL with no program: skein dev on a file of its own, (ns user), in the open
+folder's project if it has one (in its .skein-cache, so the project's namespaces can be
+required), else in a temporary folder."
+  [wb]
+  (let [f (folder wb)
+        dir (if (and f (io/file? (io/path f "project.skn")))
+              (io/path f ".skein-cache" "repl")
+              (io/temp-dir "studio-repl"))
+        main (io/path dir "user.skn")]
+    (io/make-dirs dir)
+    (io/write-file main "(ns user)\n")
+    (start-inferior! wb (or f dir) main "the REPL")))
 
 (defn connect-swank!
   "Ask for a host:port and connect to the Swank server there."
@@ -993,6 +1020,7 @@ finds."
      (c "Find" "Go to Symbol…" "Primary+Shift+T" (fn [] (goto-symbol! wb)))
      (c "Find" "Go to Definition" "Alt+." (fn [] (goto-definition! wb)))
      (c "Run" "Run Program" "Primary+R" (fn [] (run-program! wb)))
+     (c "Run" "Start REPL" "Primary+Shift+R" (fn [] (start-repl! wb)))
      (c "Run" "Stop Program" "Primary+." (fn [] (stop-program! wb)))
      (c "Run" "Connect to Swank…" nil (fn [] (connect-swank! wb)))
      (c "Eval" "Evaluate Form" "Primary+Return" (fn [] (eval-form! wb)))
@@ -1121,8 +1149,17 @@ shown. opts: :size [width height]."
          output (ui/code-view {:editable false :line-numbers false :wrap true
                                :tab-label "Output"})
          repl-panel (repl/make-repl
-                     (fn [text] (when-let [inf (:inferior @st)]
-                                  (swank/listener-eval (:conn inf) text)))
+                     (fn [text]
+                       (if-let [inf (:inferior @st)]
+                         (swank/listener-eval (:conn inf) text)
+                         ;; no program: start a REPL (unless one is starting), then send it
+                         (when-let [w @wb-ref]
+                           (swap! st update :repl-pending (fnil conj []) text)
+                           (when-not (:starting @st)
+                             (repl/append! (:repl w) (str "; Starting a REPL (Run ▸ Start "
+                                                          "REPL); Run ▸ Run Program runs the "
+                                                          "project instead\n"))
+                             (start-repl! w)))))
                      (fn [prefix] (if-let [inf (:inferior @st)]
                                     (first (swank/call (swank/completions (:conn inf) prefix) 5))
                                     [])))

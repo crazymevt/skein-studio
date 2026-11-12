@@ -74,6 +74,31 @@
     (is (not (repl/complete-form? "(a \"b")))
     (is (not (repl/complete-form? "  ")))))
 
+(defn- wait-until
+  "Let the UI's turns run until (done?), at most secs seconds. Returns (done?)."
+  [secs done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n (* secs 10)) (done?)
+          :else (do (headless/advance! 0.1) (sleep 0.1) (recur (inc n))))))
+
+(deftest the-repl-without-a-program
+  ;; Typed with no program running, a form starts a REPL (skein dev on an (ns user) file of
+  ;; its own) and is evaluated in it once it answers.
+  (let [w (wb/make-workbench)
+        input (:input (:repl w))
+        transcript (fn [] (ui/code-text (:transcript (:repl w))))]
+    (ui/show! (:window w))
+    (ui/set-buffer-text! (:buffer input) "(+ 1 2 3)")
+    (ui/set-cursor! input 9)
+    (headless/press-key! input "Return")
+    (is (string/starts-with? (transcript) "user=> (+ 1 2 3)\n; Starting a REPL"))
+    (is (wait-until 300 (fn [] (wb/connected? w))) (:text (:message w)))
+    (is (wait-until 30 (fn [] (string/includes? (transcript) "6"))) (transcript))
+    (is (= "Running the REPL" (:text (:message w))))
+    (wb/stop-program! w)
+    (ui/close! (:window w))))
+
 (deftest forms-and-heads
   (let [text "(ns a)\n\n(defn f [x]\n  (+ x\n     (inc x)))\n\n;; end\n"
         b (ui/make-text-buffer {:text text})
