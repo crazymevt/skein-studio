@@ -16,6 +16,8 @@ everything here runs."
             [skein.markdown :as md]
             [skein.studio.settings :as settings]
             [skein.studio.workbench :as wb]
+            [skein.studio.repl :as repl]
+            [skein.studio.debugger :as debugger]
             [skein.studio.agents :as agents]
             [skein.studio.agents.claude :as claude]
             [skein.studio.agents.codex :as codex]
@@ -97,10 +99,42 @@ everything here runs."
     :notice [[:p [:i (str (when (:error e) "⚠ ") (:text e))]]]
     []))
 
+(def ^:private skein-langs #{"skein" "skn" "clojure" "clj" "lisp"})
+
+(defn- code-actions
+  "A reply's blocks with links under each of its code blocks: Copy, Insert and, for
+Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
+  [blocks i]
+  (let [k (volatile! -1)
+        href (fn [action] (str "skein-studio:" action "/" i "/" @k))]
+    (vec (mapcat (fn [b]
+                   (if (= :pre (first b))
+                     (let [lang (when (map? (second b)) (:lang (second b)))]
+                       (vswap! k inc)
+                       [b (into [:p [:a {:href (href "copy")} "Copy"] " · "
+                                 [:a {:href (href "insert")} "Insert"]]
+                                (when (contains? skein-langs lang)
+                                  [" · " [:a {:href (href "run")} "Run in REPL"]]))])
+                     [b]))
+                 blocks))))
+
+(defn code-block
+  "The text of entry i's code block k, or nil."
+  [p i k]
+  (let [e (get (:entries (st p)) i)
+        pres (filter (fn [b] (= :pre (first b))) (md/parse (str (:text e)) {:softbreak " "}))]
+    (when-let [b (nth (vec pres) k nil)] (last b))))
+
+(defn- blocks-of [e i]
+  (let [bs (entry-blocks e)]
+    (if (= :reply (:kind e)) (code-actions bs i) bs)))
+
 (defn- render! [p]
   (swap! (:state p) assoc :render-pending false)
-  (let [entries (mapv (fn [e] (if (contains? e :blocks) e (assoc e :blocks (entry-blocks e))))
-                      (:entries (st p)))]
+  (let [entries (vec (map-indexed (fn [i e] (if (contains? e :blocks)
+                                              e
+                                              (assoc e :blocks (blocks-of e i))))
+                                  (:entries (st p))))]
     (swap! (:state p) assoc :entries entries)
     (set-slot! (:chat p) :content (vec (mapcat :blocks entries)))
     (ui/scroll-to-position! (:chat p) (ui/text-length (:chat p)))))
@@ -110,7 +144,7 @@ everything here runs."
   [p]
   (when-not (:render-pending (st p))
     (swap! (:state p) assoc :render-pending true)
-    (ui/after 0.05 (fn [] (render! p)))))
+    (wb/later! (:w p) 0.05 (fn [] (render! p)))))
 
 (defn- add-entry! [p e]
   (swap! (:state p) update :entries conj e)
@@ -307,7 +341,7 @@ everything here runs."
                          :session-id (saved-session p id)
                          :session-tools (when (saved-session p id)
                                           (agents/tools-version tools/tools))
-                         :sink (fn [e] (ui/after 0 (fn [] (on-event! p e))))})]
+                         :sink (fn [e] (wb/later! (:w p) 0 (fn [] (on-event! p e))))})]
             (swap! (:state p) assoc-in [:adapters id] a)
             (try (agents/start! a) a
                  (catch error e
@@ -392,10 +426,15 @@ everything here runs."
                     path))
             line (inc (ui/position-line (:buffer v) (:cursor v)))
             selected (ui/selected-text v)
+            form (when (and include-file (= "skn" (io/extension path)))
+                   (when-let [[s e] (wb/form-at-caret w)]
+                     (when (< (- e s) 6000) (ui/buffer-text (:buffer v) s e))))
             parts (concat
                    (when include-file
                      [(str "The user is looking at " rel ", line " line
                            (when-let [ns (wb/file-ns ed)] (str ", in namespace " ns)) ".")])
+                   (when form
+                     [(str "The top-level form at the caret:\n```skein\n" form "\n```")])
                    (when (and include-selection (seq selected))
                      [(str "Selected text:\n```\n" (agents/truncate selected 12000) "\n```")]))
             labels (concat (when include-file [rel])
@@ -457,7 +496,25 @@ the turn under way."
 
 ;;; The panel
 
-(defn- link-activated! [p href]
+(defn code-action!
+  "Copy entry i's code block k, insert it at the active editor's caret, or run it in the
+REPL (action \"copy\", \"insert\" or \"run\")."
+  [p action i k]
+  (let [w (:w p)]
+    (when-let [code (code-block p i k)]
+      (case action
+        "copy" (do (ui/set-clipboard-text! code) (wb/message! w "Copied"))
+        "insert" (if-let [ed (wb/active-editor w)]
+                   (do (ui/replace-selection! (:view ed) code)
+                       (ui/focus! (:view ed)))
+                   (wb/message! w "No editor to insert into"))
+        "run" (let [r (:repl w)]
+                (ui/set-buffer-text! (:buffer (:input r)) (string/trim code))
+                (repl/send! r)
+                (wb/show-panel! w (:widget r)))
+        nil))))
+
+(defn- open-link! [p href]
   (let [w (:w p)
         path (when-not (re-find #"^[a-z][a-z0-9+.-]*:" href)
                (if (or (io/absolute? href) (nil? (wb/folder w)))
@@ -466,6 +523,11 @@ the turn under way."
     (if (and path (io/file? path))
       (wb/open-file! w path)
       (system/open! href))))
+
+(defn- link-activated! [p href]
+  (if-let [[_ action i k] (re-find #"^skein-studio:(\w+)/(\d+)/(\d+)$" href)]
+    (code-action! p action (parse-long i) (parse-long k))
+    (open-link! p href)))
 
 (defn make-panel
   "The agent panel of the workbench w. opts: :programs, {agent-id program}, for CLIs other
@@ -548,6 +610,69 @@ than the installed ones (tests give stand-ins)."
       (ensure-agent! p (active p))
       (ui/focus! (:composer p)))))
 
+(def prompts
+  "What the editor's Agent commands ask: the open file and the selection go with them."
+  {:explain (str "Explain the selected code (or the form at the caret): what it does, and "
+                 "anything surprising.")
+   :improve (str "Suggest and make improvements to the selected code (or the form at the "
+                 "caret): clarity, idiomatic Skein, edge cases. Keep the behavior.")
+   :write-tests (str "Write tests for the function at the caret, following the project's "
+                     "test setup (skein.test), and run them with skein_eval.")
+   :fix-problems (str "Fix the problems reported in the current file. Use ide_problems to "
+                      "see them, then check the fix with skein_eval where it applies.")})
+
+(defn ask!
+  "Show the panel and send text to the agent shown, with the open file and selection as
+the check boxes say."
+  [p text]
+  (wb/show-right! (:w p))
+  (send! p text))
+
+(defn problem-prompt
+  "What Fix asks of a problem (a map of :file :line :column :message :source)."
+  [p problem]
+  (let [f (wb/folder (:w p))
+        path (:file problem)
+        rel (if (and f (string/starts-with? path (str f "/"))) (subs path (inc (count f))) path)]
+    (str "Fix this problem in " rel " (line " (:line problem) ", column "
+         (inc (or (:column problem) 0)) "): " (:message problem)
+         (case (:source problem)
+           :read "\nSkein's reader reported it."
+           :compile "\nThe compiler reported it."
+           "")
+         "\nUse skein_eval to check the fix where it applies.")))
+
+(defn error-prompt
+  "What Ask Agent asks of a debugger's event (:condition, :restarts, :frames)."
+  [e]
+  (let [[message type] (:condition e)]
+    (str "My Skein program signaled an error and the debugger is open.\n\n"
+         "Condition: " message (when type (str " [" type "]")) "\n\n"
+         "Restarts:\n"
+         (string/join "\n" (map-indexed (fn [i [nm desc]] (str "  " i ": " nm " — " desc))
+                                        (:restarts e)))
+         "\n\nBacktrace (top frames):\n"
+         (string/join "\n" (map (fn [[i text]] (str "  " i ": " text)) (take 15 (:frames e))))
+         "\n\nExplain the cause and suggest a fix. You can use skein_eval to look at the "
+         "running program.")))
+
+(defn fix-selected-problem!
+  "Ask the agent to fix the problem selected in the Problems panel."
+  [p]
+  (let [w (:w p)
+        i (first (:selected-indices (:problems-list w)))]
+    (if-let [problem (when i (nth (wb/all-problems w) i nil))]
+      (ask! p (problem-prompt p problem))
+      (wb/message! w "Select a problem first"))))
+
+(defn ask-about-error!
+  "Ask the agent about the error the debugger shows."
+  [p]
+  (let [w (:w p)]
+    (if-let [e (debugger/current (:debugger w))]
+      (ask! p (error-prompt e))
+      (wb/message! w "No error in the debugger"))))
+
 (defn install!
   "Make the agent panel of the workbench w, put it on the right of the editors and give
 the workbench its commands. Returns the panel."
@@ -555,10 +680,27 @@ the workbench its commands. Returns the panel."
   ([w opts]
    (let [p (make-panel w opts)]
      (wb/set-right-panel! w (:widget p))
-     (wb/add-commands! w [{:menu "View" :separator true}
-                          {:menu "View" :title "Agent" :shortcut "Primary+J"
-                           :run (fn [] (toggle! p))}
-                          {:menu "View" :title "New Agent Chat" :shortcut nil
-                           :run (fn [] (new-chat! p))}])
+     (wb/add-commands!
+      w [{:menu "View" :separator true}
+         {:menu "View" :title "Agent" :shortcut "Primary+J" :run (fn [] (toggle! p))}
+         {:menu "Agent" :title "Explain This Code" :run (fn [] (ask! p (:explain prompts)))}
+         {:menu "Agent" :title "Improve This Code" :run (fn [] (ask! p (:improve prompts)))}
+         {:menu "Agent" :title "Write Tests for This"
+          :run (fn [] (ask! p (:write-tests prompts)))}
+         {:menu "Agent" :separator true}
+         {:menu "Agent" :title "Fix Problems in This File"
+          :run (fn [] (ask! p (:fix-problems prompts)))}
+         {:menu "Agent" :title "Fix the Selected Problem" :run (fn [] (fix-selected-problem! p))}
+         {:menu "Agent" :title "Ask About the Error" :run (fn [] (ask-about-error! p))}
+         {:menu "Agent" :separator true}
+         {:menu "Agent" :title "New Chat" :run (fn [] (new-chat! p))}])
+     ;; right-clicking a problem or the debugger asks the agent from there
+     (set-slot! (:problems-list w) :context-menu
+                (ui/menu {} (ui/menu-item {:label "Ask the Agent to Fix"
+                                           :on-activate (fn [_] (fix-selected-problem! p))})))
+     (let [m (fn [] (ui/menu {} (ui/menu-item {:label "Ask the Agent About This Error"
+                                               :on-activate (fn [_] (ask-about-error! p))})))]
+       (set-slot! (:frames (:debugger w)) :context-menu (m))
+       (set-slot! (:restarts (:debugger w)) :context-menu (m)))
      (ui/on (:window w) :closed (fn [_] (stop-agents! p)))
      p)))

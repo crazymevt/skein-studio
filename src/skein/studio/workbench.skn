@@ -34,6 +34,14 @@ commands here are what its menus do, and what tests call.
 
 (defn- state [wb] @(:state wb))
 
+(defn later!
+  "Call f on the UI's thread seconds from now (0: as soon as it can), unless the backend
+the workbench was made with is no longer the one in use: its widgets belong to that
+backend, and a test may have gone on to another. Returns the timer, or nil."
+  [wb seconds f]
+  (when (identical? (:backend wb) (ui/current-backend))
+    (ui/after seconds f)))
+
 (defn folder
   "The workbench's folder, or nil."
   [wb]
@@ -126,7 +134,7 @@ window's title."
 (defn- schedule-session-save! [wb]
   (when-not (:session-timer (state wb))
     (swap! (:state wb) assoc :session-timer
-           (ui/after 0.5 (fn [] (swap! (:state wb) dissoc :session-timer)
+           (later! wb 0.5 (fn [] (swap! (:state wb) dissoc :session-timer)
                            (settings/save-session! (session wb)))))))
 
 ;;; Editors
@@ -295,7 +303,7 @@ Returns true if it closed."
       (loop []
         (when-let [e (<! (:events w))]
           ;; On the UI's thread, in turn with its events.
-          (ui/after 0 (fn [] (file-changed! wb (:path e))))
+          (later! wb 0 (fn [] (file-changed! wb (:path e))))
           (recur))))))
 
 ;;; The folder
@@ -353,16 +361,16 @@ Returns true if it closed."
 
 (defn- async!
   "Run f on a fiber, then call done with {:value v} or {:error e} on the UI's thread."
-  [f done]
+  [wb f done]
   (future (let [r (try {:value (f)} (catch error e {:error e}))]
-            (ui/after 0 (fn [] (done r))))))
+            (later! wb 0 (fn [] (done r))))))
 
 (defn- reason [e] (or (ex-message e) (str e)))
 
 (defn- on-ui
   "Call (f wb x) on the UI's thread, in turn with its events."
   [wb f x]
-  (ui/after 0 (fn [] (f wb x))))
+  (later! wb 0 (fn [] (f wb x))))
 
 (defn append-output!
   "Add text to the Output panel."
@@ -424,7 +432,7 @@ Skein file, and connect to it."
       (message! wb "Nothing to run: no project.skn with a :main, and no Skein file open")
       (do (stop-program! wb)
           (message! wb (str "Starting " (io/file-name main) " under skein dev…"))
-          (async! (fn [] (inferior/start! (or f (io/parent main)) main
+          (async! wb (fn [] (inferior/start! (or f (io/parent main)) main
                                           (fn [line] (on-ui wb append-output! (str line "\n")))
                                           (fn [e] (on-ui wb handle-swank-event! e))))
                   (fn [r] (if-let [inf (:value r)]
@@ -442,7 +450,7 @@ Skein file, and connect to it."
       (if-not port
         (message! wb (str "Not a host:port: " answer))
         (do (stop-program! wb)
-            (async! (fn [] (inferior/connect! host port (fn [e] (on-ui wb handle-swank-event! e))))
+            (async! wb (fn [] (inferior/connect! host port (fn [e] (on-ui wb handle-swank-event! e))))
                     (fn [r] (if-let [inf (:value r)]
                               (running! wb inf (str "Connected to " answer))
                               (message! wb (str "Couldn't connect to " answer ": "
@@ -480,7 +488,7 @@ Skein file, and connect to it."
         (let [ed (active-editor wb)
               text (ui/buffer-text (:buffer (:view ed)) s e)]
           (message! wb "Evaluating…")
-          (async! (fn [] (swank/call (swank/interactive-eval conn text (request-opts ed)) 120))
+          (async! wb (fn [] (swank/call (swank/interactive-eval conn text (request-opts ed)) 120))
                   (fn [r] (message! wb (if (contains? r :value) (str (:value r))
                                            (reason (:error r)))))))))))
 
@@ -501,7 +509,7 @@ Skein file, and connect to it."
               b (:buffer (:view ed))
               line (ui/position-line b s)
               text (ui/buffer-text b s e)]
-          (async! (fn [] (swank/call (swank/compile-string
+          (async! wb (fn [] (swank/call (swank/compile-string
                                       conn text (docs/document-name (:document ed))
                                       (:path (:document ed)) line (ui/position-column b s)
                                       (request-opts ed))
@@ -517,7 +525,7 @@ Skein file, and connect to it."
       (when-let [ed (active-editor wb)]
         (save-editor! wb ed)
         (let [path (:path (:document ed))]
-          (async! (fn [] (swank/call (swank/load-file conn path) 120))
+          (async! wb (fn [] (swank/call (swank/load-file conn path) 120))
                   (fn [r] (message! wb (if (contains? r :value)
                                          (str "Loaded " (io/file-name path))
                                          (reason (:error r)))))))))))
@@ -530,7 +538,7 @@ Skein file, and connect to it."
       (when-let [ed (active-editor wb)]
         (save-editor! wb ed)
         (let [path (:path (:document ed))]
-          (async! (fn [] (swank/call (swank/compile-file conn path) 120))
+          (async! wb (fn [] (swank/call (swank/compile-file conn path) 120))
                   (fn [r] (set-compile-problems! wb path r)
                     (message! wb (compile-result-message
                                   r (str "Compiled " (io/file-name path)))))))))))
@@ -569,7 +577,7 @@ caret there. Returns the editor, or nil."
   "If there is a program, call (f conn) on a fiber, then (done r) on the UI's thread with
 {:value v} or {:error e}."
   [wb f done]
-  (with-program wb (fn [conn] (async! (fn [] (f conn)) done))))
+  (with-program wb (fn [conn] (async! wb (fn [] (f conn)) done))))
 
 (defn- debugger-actions [wb]
   {:restart (fn [thread level i]
@@ -611,7 +619,7 @@ caret there. Returns the editor, or nil."
         (let [v (:view ed)
               [s e] (if (ui/selection-empty? v) (form-at-caret wb) (ui/selection v))]
           (when s
-            (async! (fn [] (swank/call (swank/inspect conn (ui/buffer-text (:buffer v) s e)
+            (async! wb (fn [] (swank/call (swank/inspect conn (ui/buffer-text (:buffer v) s e)
                                                       (request-opts ed))
                                        60))
                     (fn [r] (show-inspected! wb r)))))))))
@@ -635,7 +643,7 @@ caret there. Returns the editor, or nil."
     (fn [conn]
       (if-let [nm (symbol-at-caret wb)]
         (let [ed (active-editor wb)]
-          (async! (fn [] (swank/call (swank/find-definitions conn nm (request-opts ed)) 10))
+          (async! wb (fn [] (swank/call (swank/find-definitions conn nm (request-opts ed)) 10))
                   (fn [r] (let [[[_ loc]] (when (sequential? (:value r)) (vec (:value r)))]
                             (if loc
                               (goto-location! wb loc)
@@ -686,7 +694,7 @@ caret there. Returns the editor, or nil."
   (let [path (:path (:document ed))]
     (when (= "skn" (io/extension path))
       (let [text (ui/buffer-text (:buffer (:view ed)))]
-        (async! (fn [] (problems/read-problems path text))
+        (async! wb (fn [] (problems/read-problems path text))
                 (fn [r] (when (and (contains? r :value) (editor-for wb path))
                           (set-problems-of! wb path :read (:value r)))))))))
 
@@ -714,14 +722,14 @@ caret there. Returns the editor, or nil."
           conn (:conn (inferior wb))]
       (if-not head
         (set-slot! (:hint wb) :text "")
-        (async! (fn [] (swank/call (swank/operator-arglist conn head (request-opts ed)) 5))
+        (async! wb (fn [] (swank/call (swank/operator-arglist conn head (request-opts ed)) 5))
                 (fn [r] (set-slot! (:hint wb) :text (if (string? (:value r)) (:value r) ""))))))
     (set-slot! (:hint wb) :text "")))
 
 (defn- schedule! [wb key seconds f]
   (when-let [t (get-in (state wb) [:timers key])] (ui/stop-timer! t))
   (swap! (:state wb) assoc-in [:timers key]
-         (ui/after seconds (fn [] (swap! (:state wb) update :timers dissoc key) (f)))))
+         (later! wb seconds (fn [] (swap! (:state wb) update :timers dissoc key) (f)))))
 
 (defn offer-completions!
   "Show the program's completions of the symbol before the caret, if it is two
@@ -732,7 +740,7 @@ characters or more."
     (when (and (connected? wb) (identical? ed (active-editor wb)) (>= (count prefix) 2)
                (ui/selection-empty? v))
       (let [conn (:conn (inferior wb))]
-        (async! (fn [] (first (swank/call (swank/completions conn prefix (request-opts ed)) 5)))
+        (async! wb (fn [] (first (swank/call (swank/completions conn prefix (request-opts ed)) 5)))
                 (fn [r] (let [names (vec (remove (fn [n] (= n prefix)) (or (:value r) [])))]
                           (when (and (seq names) (= [start prefix] (symbol-before v)))
                             (swap! (:state wb) assoc :completing [ed start])
@@ -932,7 +940,7 @@ finds."
           query (:text entry)
           prefix (count (str f "/"))]
       (set-slot! status :text "Searching…")
-      (async! (fn [] (search/in-files f query (:checked regex) (:checked case) 2000))
+      (async! wb (fn [] (search/in-files f query (:checked regex) (:checked case) 2000))
               (fn [r]
                 (let [found (or (:value r) [])]
                   (swap! (:state wb) assoc :search-results found)
@@ -1051,7 +1059,7 @@ menus, as a panel made outside it does."
         (filter (fn [c] (= menu (:menu c))) (commands wb))))
 
 (defn- menus [wb]
-  (ui/menu-bar {}
+  (apply ui/menu-bar {}
     (apply ui/menu {:title "File"} (conj (menu-items wb "File") (ui/menu-item {:role :quit})))
     (ui/menu {:title "Edit"}
       (ui/menu-item {:role :undo}) (ui/menu-item {:role :redo}) (ui/menu-separator)
@@ -1060,7 +1068,11 @@ menus, as a panel made outside it does."
     (apply ui/menu {:title "Find"} (menu-items wb "Find"))
     (apply ui/menu {:title "Run"} (menu-items wb "Run"))
     (apply ui/menu {:title "Eval"} (menu-items wb "Eval"))
-    (apply ui/menu {:title "View"} (menu-items wb "View"))))
+    ;; menus only commands added from outside have (the Agent menu), before View
+    (concat (for [m (distinct (map :menu (:extra-commands (state wb))))
+                  :when (not (contains? #{"File" "Find" "Run" "Eval" "View"} m))]
+              (apply ui/menu {:title m} (menu-items wb m)))
+            [(apply ui/menu {:title "View"} (menu-items wb "View"))])))
 
 ;;; The window
 
@@ -1151,7 +1163,7 @@ shown. opts: :size [width height]."
              :message message :position position
              :hint hint :output output :repl repl-panel :popup popup :state st
              :debugger dbg :inspector insp :problems-list problems-list :panels panels
-             :right right}]
+             :right right :backend (ui/current-backend)}]
      (reset! wb-ref wb)
      ;; The find bar
      (ui/on find-entry :changed (fn [_] (show-match-count! wb (find-matches wb) nil)))

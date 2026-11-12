@@ -161,3 +161,64 @@
       (is (= "a.png, b.txt" (:text (:attachments-label p)))))
     (headless/answer! 1 1 1)
     (ui/close! (:window w))))
+
+(deftest asking-from-elsewhere
+  (let [root (io/temp-dir "studio-agent-ask")
+        w (wb/make-workbench)]
+    (io/make-dirs (io/path root "src/app"))
+    (io/write-file (io/path root "src/app/main.skn")
+                   "(ns app.main)\n\n(defn add [a b]\n  (+ a b))\n")
+    (ui/show! (:window w))
+    (wb/open-folder! w root)
+    (let [p (panel/install! w)]
+      (testing "the Agent menu, in the menu bar before View"
+        (is (= ["File" "Edit" "Find" "Run" "Eval" "Agent" "View"]
+               (mapv :title (:children (:menu-bar (:window w))))))
+        (is (= ["Explain This Code" "Improve This Code" "Write Tests for This"
+                "Fix Problems in This File" "Fix the Selected Problem" "Ask About the Error"
+                "New Chat"]
+               (vec (keep (fn [c] (when (= "Agent" (:menu c)) (:title c))) (wb/commands w))))))
+      (testing "right-clicking a problem or the debugger"
+        (is (some? (:context-menu (:problems-list w))))
+        (is (some? (:context-menu (:frames (:debugger w))))))
+      (testing "what a problem and an error ask"
+        (is (= (str "Fix this problem in src/app/main.skn (line 3, column 7): unbalanced\n"
+                    "Skein's reader reported it.\n"
+                    "Use skein_eval to check the fix where it applies.")
+               (panel/problem-prompt p {:file (io/path (wb/folder w) "src/app/main.skn")
+                                        :line 3 :column 6 :message "unbalanced" :source :read})))
+        (let [text (panel/error-prompt {:condition ["kaboom" "error"]
+                                        :restarts [["abort" "Return to the REPL"]]
+                                        :frames [[0 "(boom)"] [1 "(main)"]]})]
+          (is (string/includes? text "Condition: kaboom [error]") text)
+          (is (string/includes? text "  0: abort — Return to the REPL") text)
+          (is (string/includes? text "  1: (main)") text))
+        (panel/fix-selected-problem! p)
+        (is (= "Select a problem first" (:text (:message w))))
+        (panel/ask-about-error! p)
+        (is (= "No error in the debugger" (:text (:message w)))))
+      (testing "the form at the caret goes with the open file"
+        (wb/open-file! w (io/path (wb/folder w) "src/app/main.skn"))
+        (ui/set-cursor! (:view (wb/active-editor w)) 20)
+        (is (string/includes? (first (panel/context p true false))
+                              (str "The top-level form at the caret:\n```skein\n"
+                                   "(defn add [a b]\n  (+ a b))\n```"))))
+      (testing "a reply's code blocks: copied, inserted, and Skein's run in the REPL"
+        (panel/on-event! p {:type :message :agent "claude" :item "m1"
+                            :text "Try:\n\n```skein\n(add 1 2)\n```\n\nor:\n\n```sh\nls\n```"})
+        (wait-for 1 (fn [] false))
+        (let [text (panel/chat-text p)]
+          (is (string/includes? text "(add 1 2)\nCopy · Insert · Run in REPL") text)
+          (is (string/ends-with? text "ls\nCopy · Insert") (pr-str text)) "no Run for sh")
+        (is (= ["skein-studio:copy/0/0" "skein-studio:insert/0/0" "skein-studio:run/0/0"
+                "skein-studio:copy/0/1" "skein-studio:insert/0/1"]
+               (mapv (fn [[_ _ href]] href) (:links (:chat p)))))
+        (is (= "(add 1 2)\n" (panel/code-block p 0 0)))
+        (panel/code-action! p "copy" 0 1)
+        (is (= "ls\n" (ui/clipboard-text)))
+        (let [v (:view (wb/active-editor w))]
+          (ui/set-cursor! v 0)
+          (panel/code-action! p "insert" 0 0)
+          (is (string/starts-with? (ui/code-text v) "(add 1 2)\n(ns app.main)")))))
+    (headless/answer! 1 1 1)
+    (ui/close! (:window w))))
