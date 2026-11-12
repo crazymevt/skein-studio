@@ -1,27 +1,71 @@
 (ns skein.studio.main
   "Skein Studio's entry point (Skein's D-109): ./studio [folder] [--gtk]. It opens the
-folder, or the last session, on Cocoa on macOS (GTK 4 with --gtk) and GTK 4 elsewhere."
+folder, or the last session, on Cocoa on macOS (GTK 4 with --gtk) and GTK 4 elsewhere.
+With --script file it runs that scripted session (skein.studio.script) instead, with
+settings of its own, and exits with status 1 if a step fails."
   (:require [skein.ui :as ui]
             [skein.ui.cocoa :as cocoa]
             [skein.ui.gtk :as gtk]
             [skein.io :as io]
             [skein.system :as system]
             [skein.studio.settings :as settings]
-            [skein.studio.workbench :as workbench]))
+            [skein.studio.documents :as docs]
+            [skein.studio.workbench :as workbench]
+            [skein.studio.script :as script]))
 
 (defn- backend [args]
   (if (and (= :macos (system/os)) (not (some #{"--gtk"} args)))
     (cocoa/backend)
     (gtk/backend)))
 
+(defn- option [args name]
+  (second (drop-while (fn [a] (not= a name)) args)))
+
+(defn- on-ui
+  "Call f on the UI's thread, from a fiber, and give its value (or signal its error)."
+  [f]
+  (let [p (promise)]
+    (ui/after 0 (fn [] (deliver p (try [:ok (f)] (catch error e [:error e])))))
+    (let [[k v] @p]
+      (if (= k :ok) v (error (or (ex-message v) (str v)))))))
+
+(defn- run-script
+  "Run the scripted session in file on the workbench wb, in the event loop; true if every
+step passed."
+  [wb file]
+  (let [result (atom nil)]
+    (ui/show! (:window wb))
+    (future
+      (let [r (try (script/run-script! wb (script/read-script file)
+                                       {:base "." :on-ui on-ui :pump (fn [] (sleep 0.1))
+                                        :snapshots (system/getenv "SKEIN_STUDIO_SNAPSHOTS")
+                                        :log (fn [line] (println (str "; " line)))})
+                   (catch error e {:ok false :reason (or (ex-message e) (str e))}))]
+        (reset! result r)
+        (on-ui (fn []
+                 (workbench/stop-program! wb)
+                 (doseq [ed (workbench/editors wb)] (docs/reload! (:document ed)))
+                 (ui/close! (:window wb))))))
+    (ui/run!)
+    (:ok @result)))
+
 (defn -main [& args]
   (ui/use-backend! (backend args))
-  (settings/load-settings!)
-  (let [folder (first (remove (fn [a] (string? (re-find #"^--" a))) args))
-        saved (settings/load-session)
-        wb (workbench/make-workbench {:size (:size saved)})]
-    (cond folder (workbench/open-folder! wb folder)
-          (and saved (settings/setting :restore-session)) (workbench/restore-session! wb saved))
-    (ui/on (:window wb) :closed (fn [_] (ui/quit!)))
-    (ui/show! (:window wb))
-    (ui/run!)))
+  (if-let [file (option args "--script")]
+    (binding [settings/*config-dir* (io/temp-dir "studio-script")]
+      (settings/load-settings!)
+      (let [wb (workbench/make-workbench)]
+        (ui/on (:window wb) :closed (fn [_] (ui/quit!)))
+        (if (run-script wb file)
+          (println "; the scripted session passed")
+          (error "the scripted session failed"))))
+    (do (settings/load-settings!)
+        (let [folder (first (remove (fn [a] (string? (re-find #"^--" a))) args))
+              saved (settings/load-session)
+              wb (workbench/make-workbench {:size (:size saved)})]
+          (cond folder (workbench/open-folder! wb folder)
+                (and saved (settings/setting :restore-session))
+                (workbench/restore-session! wb saved))
+          (ui/on (:window wb) :closed (fn [_] (ui/quit!)))
+          (ui/show! (:window wb))
+          (ui/run!)))))

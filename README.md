@@ -27,6 +27,10 @@ session are kept in the application's config directory (`Skein Studio`).
 
 ```sh
 ../skein/skein test
+./studio --script examples/session.edn
 ```
 
-They run headless, and on Cocoa and GTK where those can open a window.
+The tests run headless, and on Cocoa and GTK where those can open a window; some run a
+program under a real `skein dev`. The scripted session (`examples/session.edn`, run by
+`skein.studio.script`) drives the IDE as a user would: it opens `examples/sample`, runs
+it, edits and evaluates, hits an error and restarts. CI runs both on macOS and Linux.

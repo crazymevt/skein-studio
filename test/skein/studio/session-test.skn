@@ -1,0 +1,54 @@
+(ns skein.studio.session-test
+  (:require [skein.test :refer [deftest is testing]]
+            [skein.ui :as ui]
+            [skein.ui.cocoa :as cocoa]
+            [skein.ui.gtk :as gtk]
+            [skein.io :as io]
+            [skein.system :as system]
+            [skein.studio.settings :as settings]
+            [skein.studio.documents :as docs]
+            [skein.studio.workbench :as wb]
+            [skein.studio.script :as script]))
+
+;; The scripted session (Skein's M3.7 step 6, D-109): examples/session.edn run against the
+;; IDE on the platform's own widgets, Cocoa on macOS and GTK where it can open a display,
+;; with a copy of the sample project and a program under a real skein dev. With
+;; SKEIN_STUDIO_SNAPSHOTS set to a folder, the session's picture is kept there.
+
+(defn- copy-sample
+  "A copy of examples/sample in a temporary folder."
+  []
+  (let [to (io/temp-dir "studio-session")
+        from "examples/sample"
+        n (inc (count from))]
+    (doseq [f (io/walk from {:dirs false})]
+      (let [dest (io/path to (subs f n))]
+        (io/make-dirs (io/parent dest))
+        (io/write-file dest (io/read-file f))))
+    to))
+
+(defn- session [backend run-for! label]
+  (ui/use-backend! backend)
+  (binding [settings/*config-dir* (io/temp-dir "studio-config")]
+    (settings/load-settings!)
+    (let [w (wb/make-workbench)]
+      (ui/show! (:window w))
+      (run-for! 0.2)
+      (let [shots (system/getenv "SKEIN_STUDIO_SNAPSHOTS")
+            r (script/run-script! w (script/read-script "examples/session.edn")
+                                  {:folder (copy-sample) :pump (fn [] (run-for! 0.1))
+                                   :snapshots (when shots (io/make-dirs shots) shots)
+                                   :log (fn [line] (println (str "; " label " " line)))})]
+        (is (:ok r) (pr-str r)))
+      (wb/stop-program! w)
+      ;; The session's edits go, so closing asks nothing.
+      (doseq [ed (wb/editors w)] (docs/reload! (:document ed)))
+      (ui/close! (:window w)))))
+
+(deftest on-cocoa
+  (when (= :macos (system/os))
+    (session (cocoa/backend) cocoa/run-for! "cocoa")))
+
+(deftest on-gtk
+  (when (gtk/available?)
+    (session (gtk/backend) gtk/run-for! "gtk")))

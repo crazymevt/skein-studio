@@ -388,8 +388,10 @@ Returns true if it closed."
   (case (:event e)
     :output (repl/append! (:repl wb) (:text e))
     :new-package (repl/set-prompt! (:repl wb) (str (:prompt e) "=> "))
-    :disconnected (do (swap! (:state wb) dissoc :inferior)
-                      (message! wb (str "The program's Swank disconnected: " (:reason e))))
+    ;; Only one the user didn't ask for: Stop Program has forgotten the program already.
+    :disconnected (when (inferior wb)
+                    (swap! (:state wb) dissoc :inferior)
+                    (message! wb (str "The program's Swank disconnected: " (:reason e))))
     :debug (do (debugger/debug! (:debugger wb) e)
                (show-panel! wb (:widget (:debugger wb)))
                (message! wb (str "Error: " (first (:condition e)))))

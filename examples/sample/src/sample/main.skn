@@ -1,0 +1,16 @@
+(ns sample.main
+  "A small program for Skein Studio's scripted session: it adds, and it can fail.")
+
+(defn add
+  "The sum of a and b."
+  [a b]
+  (+ a b))
+
+(defn boom
+  "Fail, for the debugger."
+  []
+  (error "kaboom"))
+
+(defn -main [& args]
+  (println "sample started")
+  (println "2 + 3 is" (add 2 3)))

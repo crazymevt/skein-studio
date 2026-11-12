@@ -1,0 +1,34 @@
+;; Skein Studio's scripted session (Skein's M3.7 step 6, D-109): the steps
+;; skein.studio.script runs against the IDE, as a user would work. It opens the sample
+;; project, runs it under skein dev, edits and evaluates, hits an error and restarts.
+;; ./studio --script examples/session.edn runs it, as does CI.
+[[:open-folder "examples/sample"]
+ [:open-file "src/sample/main.skn"]
+ [:expect-style "defn" :definer]
+ [:run-program]
+ [:wait :connected 300]
+ [:wait :output "sample started" 30]
+ ;; Edit: a new definition, typed at the end, compiled into the running program.
+ [:append "\n(defn triple [x]\n(* 3 x))\n"]
+ [:expect-text "(defn triple [x]\n  (* 3 x))"]
+ [:caret-in "(defn triple"]
+ [:command "Compile Form"]
+ [:wait :message "Compiled the form" 30]
+ ;; Evaluate: in the editor and at the REPL.
+ [:append "\n(triple (add 1 1))\n"]
+ [:caret-in "(triple (add"]
+ [:command "Evaluate Form"]
+ [:wait :message "=> 6" 30]
+ [:repl "(triple 4)"]
+ [:wait :repl "12" 30]
+ ;; An error: the debugger, then its abort restart; the program goes on.
+ [:append "\n(boom)\n"]
+ [:caret-in "(boom)"]
+ [:command "Evaluate Form"]
+ [:wait :debugger "kaboom" 30]
+ [:restart "abort"]
+ [:wait :no-debugger 30]
+ [:repl "(add 40 2)"]
+ [:wait :repl "42" 30]
+ [:command "Stop Program"]
+ [:snapshot "session"]]

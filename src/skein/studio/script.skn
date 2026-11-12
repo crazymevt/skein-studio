@@ -1,0 +1,124 @@
+(ns skein.studio.script
+  "Scripted sessions (Skein's M3.7 step 6, D-109): a session written as data, a vector of
+steps, that runs against a workbench as a user would work, typing a character at a time
+and choosing commands by their titles. CI runs examples/session.edn so, on Cocoa and GTK.
+
+Steps: [:open-folder path] [:open-file path] (relative to the folder) [:append text]
+(typed at the end of the active editor) [:caret-in text] [:command title] [:run-program]
+[:repl text] [:restart name] [:snapshot name] [:expect-text text] [:expect-style text
+style] and [:wait what arg secs], what one of :connected, :output, :message, :repl,
+:debugger and :no-debugger."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.edn :as edn]
+            [skein.string :as string]
+            [skein.studio.workbench :as wb]
+            [skein.studio.editor :as editor]
+            [skein.studio.repl :as repl]
+            [skein.studio.debugger :as debugger]))
+
+(defn- active-view [w]
+  (or (:view (wb/active-editor w)) (error "no editor is open")))
+
+(defn- type-text!
+  "Type text into the view a character at a time, as the keyboard would: Return through
+the editor's own handling, the rest as text input (pairs, typing over closers)."
+  [v text]
+  (doseq [c text]
+    (if (= c \newline)
+      (editor/newline-and-indent! v)
+      (ui/type-text! v (str c)))))
+
+(defn- style-at [v p]
+  (some (fn [[s e a]] (when (and (<= s p) (< p e)) (:style a))) (ui/text-runs v)))
+
+(defn- check [ok what]
+  (when-not ok (error what))
+  true)
+
+(defn- condition-met?
+  "Whether the condition of a :wait step holds now."
+  [w what arg]
+  (case what
+    :connected (wb/connected? w)
+    :output (string/includes? (ui/code-text (:output w)) arg)
+    :message (string/includes? (str (:text (:message w))) arg)
+    :repl (string/includes? (ui/code-text (:transcript (:repl w))) arg)
+    :debugger (when-let [e (debugger/current (:debugger w))]
+                (string/includes? (str (first (:condition e))) arg))
+    :no-debugger (nil? (debugger/current (:debugger w)))
+    (error (str "no such wait: " what))))
+
+(defn- run-step!
+  "Do one step (not a :wait) on the workbench. opts: :folder, :base (where relative
+folders are), :snapshots (a folder for pictures)."
+  [w step opts]
+  (let [[kind a b] step]
+    (case kind
+      :open-folder (wb/open-folder! w (or (:folder opts) (io/path (:base opts) a)))
+      :open-file (wb/open-file! w (io/path (wb/folder w) a))
+      :append (let [v (active-view w)]
+                (ui/set-cursor! v (ui/text-length v))
+                (type-text! v a))
+      :caret-in (let [v (active-view w)
+                      i (string/last-index-of (ui/code-text v) a)]
+                  (check i (str "no " (pr-str a) " in the editor"))
+                  (ui/set-cursor! v (inc i)))
+      :command (let [c (first (filter (fn [c] (= a (:title c))) (wb/commands w)))]
+                 (check c (str "no command " (pr-str a)))
+                 ((:run c)))
+      :run-program (wb/run-program! w)
+      :repl (let [input (:input (:repl w))]
+              (ui/set-buffer-text! (:buffer input) a)
+              (repl/send! (:repl w)))
+      :restart (let [d (:debugger w)
+                     e (debugger/current d)
+                     i (first (keep-indexed (fn [i [nm _]] (when (= a nm) i)) (:restarts e)))]
+                 (check i (str "no restart " a))
+                 (ui/row-activated-by-user! (:restarts d) i))
+      :snapshot (when-let [dir (:snapshots opts)]
+                  (io/write-bytes (io/path dir (str a ".png")) (ui/snapshot (:window w))))
+      :expect-text (check (string/includes? (ui/code-text (active-view w)) a)
+                          (str "the editor has no " (pr-str a)))
+      :expect-style (let [v (active-view w)
+                          i (string/index-of (ui/code-text v) a)]
+                      (check (and i (= b (style-at v i)))
+                             (str (pr-str a) " isn't colored " b)))
+      (error (str "no such step: " kind)))))
+
+(defn run-script!
+  "Run steps against the workbench w. on-ui calls a function on the UI's thread and gives
+its value; pump lets the UI run for a moment (sleeping, if it runs by itself). log is
+called with a line for each step. Returns {:ok true}, or {:ok false :step s :reason r}."
+  [w steps opts]
+  (let [{:keys [on-ui pump log]} (merge {:on-ui (fn [f] (f)) :pump (fn [] nil)
+                                         :log (fn [line] nil)}
+                                        opts)]
+    (loop [steps steps]
+      (if-let [step (first steps)]
+        (let [r (try
+                  (if (= :wait (first step))
+                    (let [[_ what arg secs] step
+                          secs (or (if (number? arg) arg secs) 30)
+                          arg (when-not (number? arg) arg)]
+                      (loop [n 0]
+                        (cond (on-ui (fn [] (condition-met? w what arg))) nil
+                              (>= n (* 10 secs))
+                              (error (str "waited " secs " s; the status bar says "
+                                          (pr-str (on-ui (fn [] (:text (:message w)))))))
+                              :else (do (pump) (recur (inc n))))))
+                    (do (on-ui (fn [] (run-step! w step opts)))
+                        (pump)))
+                  nil
+                  (catch error e (or (ex-message e) (str e))))]
+          (if r
+            (do (log (str "failed: " (pr-str step) ": " r))
+                {:ok false :step step :reason r})
+            (do (log (str "ok: " (pr-str step)))
+                (recur (rest steps)))))
+        {:ok true}))))
+
+(defn read-script
+  "The steps in the EDN file at path."
+  [path]
+  (edn/read-string (io/read-file path)))

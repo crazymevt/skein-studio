@@ -16,14 +16,17 @@ gives the value's text (on a fiber of its own)."
         frames (ui/list-box {:items [] :vexpand true})
         eval-entry (ui/entry {:placeholder "Evaluate in the selected frame" :hexpand true})
         result (ui/label {:text "" :text-color :secondary-text :selectable true})
+        ;; Restarts and the backtrace side by side, so a short panel keeps its labels.
         d {:widget (ui/vbox {:padding 8 :spacing 6}
                      condition
-                     (ui/label {:text "Restarts" :text-color :secondary-text})
-                     restarts
-                     (ui/label {:text "Backtrace" :text-color :secondary-text})
-                     frames
-                     (ui/hbox {:spacing 6} eval-entry)
-                     result)
+                     (ui/hbox {:spacing 8 :vexpand true}
+                       (ui/vbox {:spacing 4 :hexpand true}
+                         (ui/label {:text "Restarts" :text-color :secondary-text})
+                         restarts)
+                       (ui/vbox {:spacing 4 :hexpand true}
+                         (ui/label {:text "Backtrace" :text-color :secondary-text})
+                         frames))
+                     (ui/hbox {:spacing 6} eval-entry result))
            :condition condition :restarts restarts :frames frames :eval-entry eval-entry
            :result result :stack (atom []) :actions actions}]
     d))

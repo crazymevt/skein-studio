@@ -1,0 +1,5 @@
+;; The sample project Skein Studio's scripted session opens (Skein's M3.7 step 6, D-109).
+{:name "sample"
+ :version "0.1.0"
+ :main sample.main/-main
+ :paths ["src"]}

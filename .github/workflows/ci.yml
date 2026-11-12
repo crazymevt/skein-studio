@@ -124,3 +124,16 @@ jobs:
           else
             ../skein/skein test
           fi
+
+      # The IDE itself, as ./studio starts it, through the scripted session: the sample
+      # project run under skein dev, edited, evaluated, an error and its restart.
+      - name: Scripted session
+        env:
+          GSK_RENDERER: cairo
+        run: |
+          cd skein-studio
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a ./studio --script examples/session.edn
+          else
+            ./studio --script examples/session.edn
+          fi
