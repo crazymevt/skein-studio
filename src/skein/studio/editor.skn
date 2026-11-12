@@ -11,7 +11,8 @@ when nothing is between them."
 (defclass editor-view [ui/code-view-widget]
   "A code view of a document in a language (:lang, a registered language's map)."
   (lang :init nil)
-  (highlighter :cell :atom :init nil))
+  (highlighter :cell :atom :init nil)
+  (completion :cell :atom :init nil :doc "The completion popup that takes its keys, or nil."))
 
 (defn make-view
   "An editor view of the text buffer b in the language l. opts are the code view's."
@@ -127,6 +128,8 @@ handled s; false to type it as usual."
 ;;; Keys
 
 (defmethod ui/handle-event [(v editor-view) (e ui/key-event)]
+  ;; An open completion popup takes Up, Down, Return, Tab and Escape first.
+  (when-let [p (:completion v)] (ui/handle-completion-key p e))
   (when (and (= :key-down (:signal e)) (not (ui/consumed? e)))
     (let [mods (set (:modifiers e))
           primary (contains? mods (ui/primary-modifier))]

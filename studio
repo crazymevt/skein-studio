@@ -10,4 +10,6 @@ if [ $# -gt 0 ] && [ -d "$1" ]; then
   set -- "$folder" "$@"
 fi
 cd "$here"
+# The program it runs under skein dev is built with this Skein too.
+export SKEIN_HOME=$(cd "$skein" && pwd)
 exec "$skein/skein" run --release src/skein/studio/main.skn "$@"

@@ -19,7 +19,11 @@ commands here are what its menus do, and what tests call.
             [skein.studio.lang :as lang]
             [skein.studio.lang.skein]
             [skein.studio.editor :as editor]
-            [skein.studio.highlight :as highlight]))
+            [skein.studio.highlight :as highlight]
+            [skein.studio.lang.skein :as sk]
+            [skein.studio.inferior :as inferior]
+            [skein.studio.repl :as repl]
+            [skein.swank.client :as swank]))
 
 ;;; State
 
@@ -108,6 +112,9 @@ window's title."
 
 ;;; Editors
 
+(def ^:private install-assists!
+  "Give an editor the program's help while typing (defined with the program, below).")
+
 (defn- refresh-editor! [wb ed]
   (set-slot! (:view ed) :tab-label (tab-label ed))
   (when (identical? ed (active-editor wb)) (refresh-title! wb)))
@@ -141,6 +148,7 @@ editor."
       (when (seq (:extensions l))
         (set-slot! v :highlighter
                    (highlight/highlighter v l (fn [] (themes/color (current-theme) :match)))))
+      (install-assists! wb ed)
       (swap! (:state wb) assoc-in [:editors v] ed)
       (ui/on (:buffer d) :changed (fn [_] (refresh-editor! wb ed)))
       (ui/on v :selection-changed (fn [_] (refresh-position! wb)))
@@ -279,6 +287,238 @@ Returns true if it closed."
     (set-slot! (:window wb) :palette (themes/widget-palette theme))
     (doseq [ed (editors wb)] (style-view! (:view ed)))))
 
+;;; Running the program: skein dev for the folder's project (or the active Skein file),
+;;; its output in the Output panel, and its REPL in the REPL panel, all through Swank.
+
+(defn inferior
+  "The program the workbench talks to, or nil."
+  [wb]
+  (:inferior (state wb)))
+
+(defn connected?
+  "True while the workbench talks to a program."
+  [wb]
+  (inferior/alive? (inferior wb)))
+
+(defn- async!
+  "Run f on a fiber, then call done with {:value v} or {:error e} on the UI's thread."
+  [f done]
+  (future (let [r (try {:value (f)} (catch error e {:error e}))]
+            (ui/after 0 (fn [] (done r))))))
+
+(defn- reason [e] (or (ex-message e) (str e)))
+
+(defn- on-ui
+  "Call (f wb x) on the UI's thread, in turn with its events."
+  [wb f x]
+  (ui/after 0 (fn [] (f wb x))))
+
+(defn append-output!
+  "Add text to the Output panel."
+  [wb text]
+  (let [v (:output wb)
+        b (:buffer v)]
+    (ui/insert-into-buffer! b (ui/buffer-length b) text)
+    (ui/scroll-to-position! v (ui/buffer-length b))))
+
+(defn handle-swank-event!
+  "Act on an event from the program's Swank."
+  [wb e]
+  (case (:event e)
+    :output (repl/append! (:repl wb) (:text e))
+    :new-package (repl/set-prompt! (:repl wb) (str (:prompt e) "=> "))
+    :disconnected (do (swap! (:state wb) dissoc :inferior)
+                      (message! wb (str "The program's Swank disconnected: " (:reason e))))
+    nil))
+
+(defn stop-program!
+  "Stop talking to the program, and stop it if the workbench started it."
+  [wb]
+  (when-let [inf (inferior wb)]
+    (swap! (:state wb) dissoc :inferior)
+    (inferior/stop! inf)
+    (message! wb "Stopped")))
+
+(defn- running! [wb inf what]
+  (swap! (:state wb) assoc :inferior inf)
+  (repl/set-prompt! (:repl wb) (str @(:package (:conn inf)) "=> "))
+  (message! wb what))
+
+(defn run-program!
+  "Run the folder's project under skein dev (its project.skn's :main), or the active
+Skein file, and connect to it."
+  [wb]
+  (let [f (folder wb)
+        active (when-let [ed (active-editor wb)] (:path (:document ed)))
+        main (or (when f (inferior/project-main f))
+                 (when (and active (= "skn" (io/extension active))) active))]
+    (if-not main
+      (message! wb "Nothing to run: no project.skn with a :main, and no Skein file open")
+      (do (stop-program! wb)
+          (message! wb (str "Starting " (io/file-name main) " under skein dev…"))
+          (async! (fn [] (inferior/start! (or f (io/parent main)) main
+                                          (fn [line] (on-ui wb append-output! (str line "\n")))
+                                          (fn [e] (on-ui wb handle-swank-event! e))))
+                  (fn [r] (if-let [inf (:value r)]
+                            (running! wb inf (str "Running " (io/file-name main)))
+                            (message! wb (str "Couldn't run " (io/file-name main) ": "
+                                              (reason (:error r)))))))))))
+
+(defn connect-swank!
+  "Ask for a host:port and connect to the Swank server there."
+  [wb]
+  (when-let [answer (ui/prompt-text "Connect to Swank at host:port"
+                                    {:default "localhost:4005" :parent (:window wb)})]
+    (let [[host port] (string/split (string/trim answer) #":")
+          port (parse-long (or port ""))]
+      (if-not port
+        (message! wb (str "Not a host:port: " answer))
+        (do (stop-program! wb)
+            (async! (fn [] (inferior/connect! host port (fn [e] (on-ui wb handle-swank-event! e))))
+                    (fn [r] (if-let [inf (:value r)]
+                              (running! wb inf (str "Connected to " answer))
+                              (message! wb (str "Couldn't connect to " answer ": "
+                                                (reason (:error r))))))))))))
+
+(defn file-ns
+  "The namespace an editor's file declares, or nil."
+  [ed]
+  (second (re-find #"\(ns\s+([^\s()\[\]{}]+)" (ui/buffer-text (:buffer (:view ed))))))
+
+(defn- request-opts [ed]
+  (if-let [ns (file-ns ed)] {:package ns} {}))
+
+(defn- with-program [wb f]
+  (if (connected? wb)
+    (f (:conn (inferior wb)))
+    (message! wb "No program: Run ▸ Run Program starts one")))
+
+(defn form-at-caret
+  "[start end] of the top-level form at the active editor's caret, or nil."
+  [wb]
+  (when-let [ed (active-editor wb)]
+    (when-let [hl (:highlighter (:view ed))]
+      (highlight/top-level-form hl (:cursor (:view ed))))))
+
+(defn eval-form!
+  "Evaluate the top-level form at the caret in the program, and show its value."
+  [wb]
+  (with-program wb
+    (fn [conn]
+      (when-let [[s e] (form-at-caret wb)]
+        (let [ed (active-editor wb)
+              text (ui/buffer-text (:buffer (:view ed)) s e)]
+          (message! wb "Evaluating…")
+          (async! (fn [] (swank/call (swank/interactive-eval conn text (request-opts ed)) 120))
+                  (fn [r] (message! wb (if (contains? r :value) (str (:value r))
+                                           (reason (:error r)))))))))))
+
+(defn- compile-result-message [r what]
+  (if-let [v (:value r)]
+    (let [[_ notes success] (when (sequential? v) (vec v))]
+      (str what (if (= false success) " failed" "")
+           (if (seq notes) (str " (" (count notes) " notes)") "")))
+    (reason (:error r))))
+
+(defn compile-form!
+  "Compile the top-level form at the caret in the program."
+  [wb]
+  (with-program wb
+    (fn [conn]
+      (when-let [[s e] (form-at-caret wb)]
+        (let [ed (active-editor wb)
+              b (:buffer (:view ed))
+              line (ui/position-line b s)
+              text (ui/buffer-text b s e)]
+          (async! (fn [] (swank/call (swank/compile-string
+                                      conn text (docs/document-name (:document ed))
+                                      (:path (:document ed)) line (ui/position-column b s)
+                                      (request-opts ed))
+                                     120))
+                  (fn [r] (message! wb (compile-result-message r "Compiled the form")))))))))
+
+(defn eval-file!
+  "Save the active file and load it into the program."
+  [wb]
+  (with-program wb
+    (fn [conn]
+      (when-let [ed (active-editor wb)]
+        (save-editor! wb ed)
+        (let [path (:path (:document ed))]
+          (async! (fn [] (swank/call (swank/load-file conn path) 120))
+                  (fn [r] (message! wb (if (contains? r :value)
+                                         (str "Loaded " (io/file-name path))
+                                         (reason (:error r)))))))))))
+
+(defn compile-file!
+  "Save the active file and compile it into the program."
+  [wb]
+  (with-program wb
+    (fn [conn]
+      (when-let [ed (active-editor wb)]
+        (save-editor! wb ed)
+        (let [path (:path (:document ed))]
+          (async! (fn [] (swank/call (swank/compile-file conn path) 120))
+                  (fn [r] (message! wb (compile-result-message
+                                        r (str "Compiled " (io/file-name path)))))))))))
+
+;;; Help while typing, from the program: the argument list of the form the caret is in,
+;;; in the status bar, and completions of the symbol being typed.
+
+(defn- symbol-before [v]
+  (let [text (ui/code-text v)
+        end (:cursor v)
+        start (loop [i end]
+                (if (and (pos? i) (not (contains? (set " \t\n()[]{}\"'`,;@^~") (nth text (dec i)))))
+                  (recur (dec i))
+                  i))]
+    [start (subs text start end)]))
+
+(defn show-arglist!
+  "Show the argument list of the form at the active editor's caret, from the program."
+  [wb]
+  (if-let [ed (and (connected? wb) (active-editor wb))]
+    (let [v (:view ed)
+          b (:buffer v)
+          start (or (first (form-at-caret wb)) (ui/line-start b (ui/position-line b (:cursor v))))
+          head (when (<= start (:cursor v))
+                 (sk/enclosing-head (string/split (ui/buffer-text b start (:cursor v)) #"\n" -1)))
+          conn (:conn (inferior wb))]
+      (if-not head
+        (set-slot! (:hint wb) :text "")
+        (async! (fn [] (swank/call (swank/operator-arglist conn head (request-opts ed)) 5))
+                (fn [r] (set-slot! (:hint wb) :text (if (string? (:value r)) (:value r) ""))))))
+    (set-slot! (:hint wb) :text "")))
+
+(defn- schedule! [wb key seconds f]
+  (when-let [t (get-in (state wb) [:timers key])] (ui/stop-timer! t))
+  (swap! (:state wb) assoc-in [:timers key]
+         (ui/after seconds (fn [] (swap! (:state wb) update :timers dissoc key) (f)))))
+
+(defn offer-completions!
+  "Show the program's completions of the symbol before the caret, if it is two
+characters or more."
+  [wb ed]
+  (let [v (:view ed)
+        [start prefix] (symbol-before v)]
+    (when (and (connected? wb) (identical? ed (active-editor wb)) (>= (count prefix) 2)
+               (ui/selection-empty? v))
+      (let [conn (:conn (inferior wb))]
+        (async! (fn [] (first (swank/call (swank/completions conn prefix (request-opts ed)) 5)))
+                (fn [r] (let [names (vec (remove (fn [n] (= n prefix)) (or (:value r) [])))]
+                          (when (and (seq names) (= [start prefix] (symbol-before v)))
+                            (swap! (:state wb) assoc :completing [ed start])
+                            (ui/show-completion-popup! (:popup wb) v {:items names})))))))))
+
+(defn- install-assists! [wb ed]
+  (let [v (:view ed)]
+    (set-slot! v :completion (:popup wb))
+    (ui/on v :selection-changed (fn [_] (schedule! wb :arglist 0.3 (fn [] (show-arglist! wb)))))
+    (ui/on (:buffer v) :changed
+           (fn [e]
+             (when (and (pos? (count (:inserted-text e))) (not (:accepting (state wb))))
+               (schedule! wb :complete 0.25 (fn [] (offer-completions! wb ed))))))))
+
 ;;; Menus
 
 (defn- item [label shortcut f]
@@ -300,6 +540,15 @@ Returns true if it closed."
       (ui/menu-item {:role :undo}) (ui/menu-item {:role :redo}) (ui/menu-separator)
       (ui/menu-item {:role :cut}) (ui/menu-item {:role :copy}) (ui/menu-item {:role :paste})
       (ui/menu-item {:role :select-all}))
+    (ui/menu {:title "Run"}
+      (item "Run Program" "Primary+R" (fn [] (run-program! wb)))
+      (item "Stop Program" "Primary+." (fn [] (stop-program! wb)))
+      (item "Connect to Swank…" nil (fn [] (connect-swank! wb))))
+    (ui/menu {:title "Eval"}
+      (item "Evaluate Form" "Primary+Return" (fn [] (eval-form! wb)))
+      (item "Compile Form" "Primary+K" (fn [] (compile-form! wb)))
+      (item "Load File" "Primary+Shift+Return" (fn [] (eval-file! wb)))
+      (item "Compile File" "Primary+Shift+K" (fn [] (compile-file! wb))))
     (ui/menu {:title "View"}
       (item "Studio Dark" nil (fn [] (apply-theme! wb "studio-dark")))
       (item "Studio Light" nil (fn [] (apply-theme! wb "studio-light"))))))
@@ -322,19 +571,40 @@ shown. opts: :size [width height]."
                                                      (open-file! @wb-ref p))))})
          tabs (ui/tabbed-pane {:vexpand true :hexpand true})
          message (ui/label {:text "" :text-color :secondary-text :hexpand true})
+         hint (ui/label {:text "" :text-color :secondary-text})
          position (ui/label {:text "" :text-color :secondary-text})
+         output (ui/code-view {:editable false :line-numbers false :wrap true
+                               :tab-label "Output"})
+         repl-panel (repl/make-repl
+                     (fn [text] (when-let [inf (:inferior @st)]
+                                  (swank/listener-eval (:conn inf) text)))
+                     (fn [prefix] (if-let [inf (:inferior @st)]
+                                    (first (swank/call (swank/completions (:conn inf) prefix) 5))
+                                    [])))
+         popup (ui/completion-popup {:max-visible-rows 10})
+         panels (ui/notebook {} (doto (:widget repl-panel) (set-slot! :tab-label "REPL")) output)
          window (ui/window {:title "Skein Studio" :width width :height height
                             :appearance (:appearance theme)
                             :palette (themes/widget-palette theme)}
                   (ui/vbox {}
                     (ui/paned {:position 240 :vexpand true}
                               (ui/scrolled-window {} tree)
-                              tabs)
+                              (ui/paned {:orientation :vertical :position (- height 300)}
+                                        tabs panels))
                     (ui/hbox {:padding [3 10] :spacing 12 :surface :status}
-                             message position)))
+                             message hint position)))
          wb {:window window :tree tree :tabs tabs :message message :position position
-             :state st}]
+             :hint hint :output output :repl repl-panel :popup popup :state st}]
      (reset! wb-ref wb)
+     ;; A completion chosen replaces the symbol being typed.
+     (ui/on popup :accept
+            (fn [e]
+              (when-let [[ed start] (:completing @st)]
+                (let [v (:view ed)]
+                  (swap! st assoc :accepting true)
+                  (try (ui/set-selection! v start (:cursor v))
+                       (ui/replace-selection! v (:value e))
+                       (finally (swap! st dissoc :accepting)))))))
      (set-slot! window :menu-bar (menus wb))
      ;; Closing a tab asks about unsaved changes first; a closed one is forgotten.
      (ui/on tabs :page-close-request
@@ -349,7 +619,8 @@ shown. opts: :size [width height]."
                                  (schedule-session-save! wb)))
      (ui/on window :close-request (fn [e] (when-not (may-quit? wb) (ui/veto e))))
      (ui/on window :resize (fn [_] (schedule-session-save! wb)))
-     (ui/on window :closed (fn [_] (stop-watching! wb) (save-session! wb)))
+     (ui/on window :closed (fn [_] (stop-watching! wb) (stop-program! wb) (save-session! wb)
+                             (ui/destroy! popup)))
      wb)))
 
 (defn restore-session!

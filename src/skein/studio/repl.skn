@@ -1,0 +1,118 @@
+(ns skein.studio.repl
+  "The REPL panel (Skein's D-109): a transcript of what was typed, printed and returned,
+and a Skein input below it, highlighted. Return sends the input when it is a whole form
+(else it starts a new line), Up and Down on its first and last lines go through what was
+sent before, and Tab completes the symbol before the caret from the program's Swank."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [skein.studio.lang :as lang]
+            [skein.studio.lang.skein :as sk]
+            [skein.studio.editor :as editor]
+            [skein.studio.highlight :as highlight]))
+
+(defclass input-view [editor/editor-view]
+  "The REPL's input: an editor view whose Return, Up, Down and Tab the REPL takes."
+  (repl :cell :atom :init nil))
+
+(defn make-repl
+  "A REPL panel: {:widget :transcript :input :state}. send is called with each input
+sent, and complete with a prefix, giving the completions (a vector of names)."
+  [send complete]
+  (let [transcript (ui/code-view {:editable false :line-numbers false :wrap true
+                                  :vexpand true})
+        b (ui/make-text-buffer {:text "" :history-limit 100})
+        state (atom {:history [] :index nil :prompt "user=> " :send send :complete complete})
+        input (ui/build input-view {:buffer b :lang (lang/language-for "repl.skn")
+                                    :line-numbers false :vexpand false}
+                        nil)
+        r {:widget (ui/paned {:orientation :vertical :position 220} transcript input)
+           :transcript transcript :input input :state state}]
+    (set-slot! input :repl r)
+    (set-slot! input :highlighter
+               (highlight/highlighter input (:lang input) (fn [] "#3A3A6A")))
+    (ui/set-buffer-text! (:buffer transcript) "")
+    r))
+
+(defn append!
+  "Add text to the end of the REPL's transcript, and show it."
+  [r text]
+  (let [t (:transcript r)
+        b (:buffer t)]
+    (ui/insert-into-buffer! b (ui/buffer-length b) text)
+    (ui/scroll-to-position! t (ui/buffer-length b))
+    r))
+
+(defn set-prompt!
+  "Show prompt (as \"user=> \") before what is sent next."
+  [r prompt]
+  (swap! (:state r) assoc :prompt prompt))
+
+(defn complete-form?
+  "True if text is whole: every bracket closed, no string or comment left open, and
+something besides spaces in it."
+  [text]
+  (let [end (reduce (fn [state line] (second (sk/lex-line line state)))
+                    sk/initial-state (string/split text #"\n" -1))]
+    (and (= end [:code 0]) (not (string/blank? text)))))
+
+(defn send!
+  "Send the input: show it after the prompt in the transcript, keep it in the history and
+clear the input."
+  [r]
+  (let [input (:input r)
+        text (ui/code-text input)
+        st (:state r)]
+    (append! r (str (:prompt @st) text "\n"))
+    (swap! st (fn [s] (assoc s :history (conj (:history s) text) :index nil)))
+    (ui/set-buffer-text! (:buffer input) "")
+    ((:send @st) text)
+    r))
+
+(defn- recall! [r step]
+  (let [st (:state r)
+        {:keys [history index]} @st
+        n (count history)
+        i (max 0 (min n (+ (or index n) step)))]
+    (when (pos? n)
+      (swap! (:state r) assoc :index i)
+      (ui/set-buffer-text! (:buffer (:input r)) (if (< i n) (nth history i) ""))
+      (ui/set-cursor! (:input r) (ui/text-length (:input r))))))
+
+(defn- symbol-start [v]
+  (let [s (ui/code-text v)]
+    (loop [i (:cursor v)]
+      (if (and (pos? i) (not (contains? (set " \t\n()[]{}\"'`,;@^~") (nth s (dec i)))))
+        (recur (dec i))
+        i))))
+
+(defn complete!
+  "Complete the symbol before the input's caret: to its completions' longest common
+start. Returns the completions."
+  [r]
+  (let [v (:input r)
+        start (symbol-start v)
+        prefix (subs (ui/code-text v) start (:cursor v))
+        names (when (pos? (count prefix)) ((:complete @(:state r)) prefix))
+        common (when (seq names)
+                 (reduce (fn [a b] (subs a 0 (count (take-while true? (map = a b))))) names))]
+    (when (and common (> (count common) (count prefix)))
+      (ui/set-selection! v start (:cursor v))
+      (ui/replace-selection! v common))
+    names))
+
+(defmethod ui/handle-event :around [(v input-view) (e ui/key-event)]
+  (let [r (:repl v)
+        b (:buffer v)
+        line (ui/position-line b (:cursor v))]
+    (if (and r (= :key-down (:signal e)) (not (ui/consumed? e)) (empty? (:modifiers e)))
+      (case (:key e)
+        :return (if (complete-form? (ui/code-text v))
+                  (do (send! r) (ui/consume! e))
+                  (call-next-method))
+        :up (if (zero? line) (do (recall! r -1) (ui/consume! e)) (call-next-method))
+        :down (if (= line (dec (ui/buffer-line-count b)))
+                (do (recall! r 1) (ui/consume! e))
+                (call-next-method))
+        :tab (do (complete! r) (ui/consume! e))
+        (call-next-method))
+      (call-next-method))))

@@ -1,0 +1,163 @@
+(ns skein.studio.program-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.studio.settings :as settings]
+            [skein.studio.lang :as lang]
+            [skein.studio.lang.skein :as sk]
+            [skein.studio.editor :as editor]
+            [skein.studio.highlight :as highlight]
+            [skein.studio.inferior :as inferior]
+            [skein.studio.repl :as repl]
+            [skein.studio.workbench :as wb]
+            [skein.process :as process]))
+
+;; Running the program (Skein's M3.7 step 3, D-109): the REPL panel, the form at the caret,
+;; and a project run under a real skein dev, driven through Swank.
+
+(use-fixtures :each
+  (fn [t]
+    (ui/use-backend! (headless/backend))
+    (binding [settings/*config-dir* (io/temp-dir "studio-config")]
+      (settings/load-settings!)
+      (t))))
+
+(deftest the-repl-panel
+  (let [sent (atom [])
+        r (repl/make-repl (fn [text] (swap! sent conj text))
+                          (fn [prefix] (filterv (fn [n] (string/starts-with? n prefix))
+                                                ["map" "mapv" "mapcat" "max"])))
+        input (:input r)]
+    (testing "Return sends a whole form, and starts a new line in an unfinished one"
+      (ui/set-buffer-text! (:buffer input) "(+ 1")
+      (ui/set-cursor! input 4)
+      (headless/press-key! input "Return")
+      (is (= [] @sent))
+      (ui/set-buffer-text! (:buffer input) "(+ 1 2)")
+      (ui/set-cursor! input 7)
+      (headless/press-key! input "Return")
+      (is (= ["(+ 1 2)"] @sent))
+      (is (= "" (ui/code-text input)))
+      (is (= "user=> (+ 1 2)\n" (ui/code-text (:transcript r)))))
+    (testing "output and values go in the transcript; the prompt follows the namespace"
+      (repl/append! r "3\n")
+      (repl/set-prompt! r "app.main=> ")
+      (ui/set-buffer-text! (:buffer input) ":k")
+      (ui/set-cursor! input 2)
+      (headless/press-key! input "Return")
+      (is (string/ends-with? (ui/code-text (:transcript r)) "3\napp.main=> :k\n")))
+    (testing "Up and Down go through what was sent"
+      (headless/press-key! input "Up")
+      (is (= ":k" (ui/code-text input)))
+      (headless/press-key! input "Up")
+      (is (= "(+ 1 2)" (ui/code-text input)))
+      (headless/press-key! input "Down")
+      (is (= ":k" (ui/code-text input)))
+      (headless/press-key! input "Down")
+      (is (= "" (ui/code-text input))))
+    (testing "Tab completes to the completions' common start"
+      (ui/set-buffer-text! (:buffer input) "(ma")
+      (ui/set-cursor! input 3)
+      (headless/press-key! input "Tab")
+      (is (= "(ma" (ui/code-text input)) "map, mapv, mapcat and max share only ma")
+      (ui/set-buffer-text! (:buffer input) "(mapc")
+      (ui/set-cursor! input 5)
+      (headless/press-key! input "Tab")
+      (is (= "(mapcat" (ui/code-text input))))
+    (is (repl/complete-form? "(a [b {:c \"d)\"}])"))
+    (is (not (repl/complete-form? "(a \"b")))
+    (is (not (repl/complete-form? "  ")))))
+
+(deftest forms-and-heads
+  (let [text "(ns a)\n\n(defn f [x]\n  (+ x\n     (inc x)))\n\n;; end\n"
+        b (ui/make-text-buffer {:text text})
+        l (lang/language-for "a.skn")
+        v (editor/make-view b l {})
+        hl (highlight/highlighter v l (fn [] "#000"))
+        at (fn [s] (string/index-of text s))
+        form [(at "(defn") (+ (at "x)))") 4)]]
+    (is (= form (highlight/top-level-form hl (at "inc"))))
+    (is (= form (highlight/top-level-form hl (at "(defn"))))
+    (is (= form (highlight/top-level-form hl (at ";; end"))) "after it, the one before")
+    (is (= [0 6] (highlight/top-level-form hl 3)))
+    (is (= "inc" (sk/enclosing-head ["(defn f [x]" "  (+ x" "     (inc "])))
+    (is (= "+" (sk/enclosing-head ["(defn f [x]" "  (+ x" "     (inc x) "])))
+    (is (= "let" (sk/enclosing-head ["(let [a "])) "a vector shows the form it is in")
+    (is (nil? (sk/enclosing-head ["(defn f [x] x)"])))))
+
+(deftest finding-the-program
+  (let [root (io/temp-dir "studio-main")]
+    (is (nil? (inferior/project-main root)))
+    (io/write-file (io/path root "project.skn") "{:name \"app\" :main app.core/-main}")
+    (io/make-dirs (io/path root "src/app"))
+    (is (nil? (inferior/project-main root)) "its file isn't there")
+    (io/write-file (io/path root "src/app/core.skn") "(ns app.core)")
+    (is (= (io/path root "src/app/core.skn") (inferior/project-main root)))
+    (is (= "src/my/game_x/player.skn" (string/replace (inferior/ns-path "src" "my.game_x.player")
+                                                      "\\" "/")))))
+
+;;; A project run under skein dev, as the user would: Run Program, evaluate a form, use the
+;;; REPL, complete, see an argument list and the program's output, stop it.
+
+(defn- wait-for
+  "Let the UI's turns run until (done?), at most secs seconds. Returns (done?)."
+  [secs done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n (* secs 10)) (done?)
+          :else (do (headless/advance! 0.1) (sleep 0.1) (recur (inc n))))))
+
+(deftest a-program-under-skein-dev
+  (let [root (io/temp-dir "studio-program")
+        main (io/path root "src/app/main.skn")]
+    (io/write-file (io/path root "project.skn") "{:name \"app\" :main app.main/-main}\n")
+    (io/make-dirs (io/parent main))
+    (io/write-file main (str "(ns app.main)\n\n(defn add\n  \"Adds.\"\n  [a b]\n  (+ a b))\n\n"
+                             "(add 2 3)\n\n(defn -main [& args]\n  (println \"started\"))\n"))
+    (let [w (wb/make-workbench)]
+      (ui/show! (:window w))
+      (wb/open-folder! w root)
+      (wb/open-file! w (io/path (wb/folder w) "src/app/main.skn"))
+      (wb/run-program! w)
+      (is (wait-for 300 (fn [] (wb/connected? w))) (:text (:message w)))
+      (when (wb/connected? w)
+        (testing "the program's output"
+          (is (wait-for 30 (fn [] (string/includes? (ui/code-text (:output w)) "started")))))
+        (testing "evaluating the form at the caret, in the file's namespace"
+          (let [v (:view (wb/active-editor w))
+                text (ui/code-text v)]
+            (ui/set-cursor! v (+ 3 (string/index-of text "(add 2 3)")))
+            (wb/eval-form! w)
+            (is (wait-for 30 (fn [] (= "=> 5" (:text (:message w))))) (:text (:message w)))))
+        (testing "the REPL"
+          (let [input (:input (:repl w))]
+            (ui/set-buffer-text! (:buffer input) "(* 6 7)")
+            (ui/set-cursor! input 7)
+            (headless/press-key! input "Return")
+            (is (wait-for 30 (fn [] (string/includes? (ui/code-text (:transcript (:repl w)))
+                                                      "42"))))))
+        (testing "an argument list while typing"
+          (let [v (:view (wb/active-editor w))
+                b (:buffer v)]
+            (ui/insert-into-buffer! b (ui/buffer-length b) "\n(add ")
+            (ui/set-cursor! v (ui/buffer-length b))
+            (wb/show-arglist! w)
+            (is (wait-for 30 (fn [] (string/includes? (:text (:hint w)) "a b")))
+                (:text (:hint w)))))
+        (testing "completions"
+          (let [v (:view (wb/active-editor w))
+                b (:buffer v)]
+            (ui/insert-into-buffer! b (ui/buffer-length b) "ad")
+            (ui/set-cursor! v (ui/buffer-length b))
+            (wb/offer-completions! w (wb/active-editor w))
+            (is (wait-for 30 (fn [] (and (:shown (:popup w))
+                                         (some #{"add"} (:items (:popup w)))))))))
+        (testing "stopping it"
+          (let [p (:process (wb/inferior w))]
+            (wb/stop-program! w)
+            (is (not (wb/connected? w)))
+            (is (wait-for 10 (fn [] (not (process/alive? p))))))))
+      (headless/answer! 1)
+      (ui/close! (:window w)))))

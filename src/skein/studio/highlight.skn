@@ -145,3 +145,24 @@ highlighter."
                      (let [l (ui/position-line b p)] (relex! hl l l))))))))
     (ui/on v :selection-changed (fn [_] (show-match! hl)))
     hl))
+
+(defn top-level-form
+  "[start end] of the top-level form around position, or of the last one before it, or
+nil: from the last line at or above position's that starts a form at depth 0, to where
+its bracket closes."
+  [hl position]
+  (let [b (:buffer (:view hl))
+        n (ui/buffer-line-count b)
+        first-token (fn [l] (first (tokens-of hl l)))
+        starts? (fn [l] (let [[s _ k d] (first-token l)]
+                          (and (= :open k) (= 0 d) (= [:code 0] (get @(:states hl) l)))))
+        start-line (loop [l (ui/position-line b position)]
+                     (cond (< l 0) nil (starts? l) l :else (recur (dec l))))]
+    (when start-line
+      (let [start (first (first-token start-line))]
+        (loop [l start-line]
+          (when (< l n)
+            (if-let [[_ e] (first (filter (fn [[s _ k d]] (and (= k :close) (= d 0) (> s start)))
+                                          (tokens-of hl l)))]
+              [start e]
+              (recur (inc l)))))))))

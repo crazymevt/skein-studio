@@ -238,3 +238,23 @@ the top) should start at."
     :indent indent-line
     :line-comment ";; "
     :pairs {\( \) \[ \] \{ \} \" \"}}))
+
+(defn enclosing-head
+  "The head of the innermost ( still open at the end of text (a vector of lines, from the
+start of a top-level form), or nil: whose argument list to show while typing."
+  [lines]
+  (let [stack (reduce (fn [{:keys [state stack]} line]
+                        (let [[tokens end] (lex-line line state)]
+                          {:state end
+                           :stack (reduce (fn [st [s e kind]]
+                                            (case kind
+                                              :open (conj st nil)
+                                              :close (if (seq st) (pop st) st)
+                                              :head (if (seq st)
+                                                      (conj (pop st) (subs line s e))
+                                                      st)
+                                              st))
+                                          stack tokens)}))
+                      {:state initial-state :stack []}
+                      lines)]
+    (first (remove nil? (rseq (:stack stack))))))

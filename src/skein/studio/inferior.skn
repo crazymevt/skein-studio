@@ -1,0 +1,93 @@
+(ns skein.studio.inferior
+  "The program being developed (Skein's D-109): run under skein dev with Swank on a free
+port, or a Swank someone else started, connected to with skein.swank.client. Its code
+never runs inside the IDE. An inferior is a map: :conn (a Swank connection), and for one
+the IDE started :process (skein dev's) and :main (the file it runs)."
+  (:require [skein.io :as io]
+            [skein.edn :as edn]
+            [skein.string :as string]
+            [skein.system :as system]
+            [skein.process :as process]
+            [skein.swank.client :as swank]))
+
+(defn skein-home
+  "Skein's checkout: $SKEIN_HOME, else ../skein beside skein-studio's checkout (the
+working directory ./studio starts in)."
+  []
+  (or (system/getenv "SKEIN_HOME") (io/absolute-path "../skein")))
+
+(defn ns-path
+  "The file of the namespace named ns-name under the folder src: game.player is
+src/game/player.skn."
+  [src ns-name]
+  (io/path src (str (string/replace ns-name "." "/") ".skn")))
+
+(defn project-main
+  "The file holding the :main of the project in folder (its project.skn), or nil."
+  [folder]
+  (let [p (io/path folder "project.skn")]
+    (when (io/file? p)
+      (let [project (try (edn/read-string (io/read-file p)) (catch error e nil))
+            main (:main project)]
+        (when (and (symbol? main) (namespace main))
+          (first (filter io/file?
+                         (map (fn [src] (ns-path (io/path folder src) (namespace main)))
+                              (or (:paths project) ["src"])))))))))
+
+(defn- swank-port [line]
+  (when-let [[_ port] (re-find #"Swank on localhost:(\d+)" line)]
+    (parse-long port)))
+
+(defn start!
+  "Run the file main under skein dev, in folder, with Swank on a free port, and connect
+to it. on-output is called with each line skein dev and the program print, on-event with
+each of Swank's events. Returns the inferior, or signals an error saying why not."
+  [folder main on-output on-event]
+  (let [home (skein-home)
+        p (process/process [(io/path home "build/skeinc") "dev" "--no-server" "--swank-port" "0"
+                            main]
+                           {:dir folder :extra-env {"SKEIN_HOME" home} :err :out})
+        lines (io/line-seq (:out p))
+        ;; Its first lines, up to the one that names Swank's port.
+        port (loop [ls lines]
+               (if-let [line (first ls)]
+                 (if-let [port (swank-port line)]
+                   (do (future (doseq [l (rest ls)] (on-output l))) port)
+                   (do (on-output line) (recur (rest ls))))
+                 nil))]
+    (when-not port
+      (process/destroy-tree! p)
+      (error (str "skein dev didn't start Swank for " main)))
+    (let [conn (swank/connect "localhost" port {:timeout 120})]
+      (swank/call (swank/create-repl conn) 60)
+      (future (loop []
+                (when-let [e (<! (swank/events conn))]
+                  (on-event e)
+                  (recur))))
+      {:conn conn :process p :main main})))
+
+(defn connect!
+  "Connect to a Swank server already running on host and port. on-event is called with
+each of its events. Returns the inferior."
+  [host port on-event]
+  (let [conn (swank/connect host port {:timeout 20})]
+    (swank/call (swank/create-repl conn) 30)
+    (future (loop []
+              (when-let [e (<! (swank/events conn))]
+                (on-event e)
+                (recur))))
+    {:conn conn}))
+
+(defn alive?
+  "True while the inferior's connection is up."
+  [inf]
+  (and inf (swank/alive? (:conn inf))))
+
+(defn stop!
+  "Disconnect from the inferior and, if the IDE started it, stop skein dev and what it
+started."
+  [inf]
+  (when inf
+    (swank/disconnect! (:conn inf))
+    (when-let [p (:process inf)]
+      (when (process/alive? p) (process/destroy-tree! p)))))
