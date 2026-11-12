@@ -25,7 +25,14 @@ the one at the caret is shown on top of the tokens' styles."
                                          style (assoc :style style)
                                          matched (assoc :background ((:match-color hl))))])
                             rs)))
-                      (transient []) tokens))]
+                      (transient []) tokens))
+        ;; Problems, underlined where they touch the line.
+        line-end (+ base (count text))
+        runs (into runs (keep (fn [[s e]]
+                                (when (and (< s (max (inc line-end) (inc base))) (> e base))
+                                  [(max s base) (min e (max line-end (inc base)))
+                                   {:underline true :color ((:problem-color hl))}]))
+                              (:problems @(:extra hl))))]
     [runs end]))
 
 (defn- relex!
@@ -105,16 +112,28 @@ the one after if it opens) and its partner, or nil."
         (when (<= p (ui/buffer-length b))
           (let [l (ui/position-line b p)] (relex! hl l l)))))))
 
+(defn set-problems!
+  "Underline ranges, [start end] each, as problems, instead of those before."
+  [hl ranges]
+  (let [b (:buffer (:view hl))
+        old (:problems @(:extra hl))
+        n (ui/buffer-length b)]
+    (swap! (:extra hl) assoc :problems (vec ranges))
+    (doseq [l (distinct (map (fn [p] (ui/position-line b (min p n)))
+                             (mapcat (fn [[s e]] [s e]) (concat old ranges))))]
+      (relex! hl l l))))
+
 (defn highlighter
   "Color the code view v's text as the language lang lexes it, and keep it colored as it
-changes. match-color is a function giving the matching bracket's background. Returns the
-highlighter."
-  [v lang match-color]
+changes. match-color and problem-color are functions giving the matching bracket's
+background and a problem's underline color. Returns the highlighter."
+  ([v lang match-color] (highlighter v lang match-color (fn [] "#ff5555")))
+  ([v lang match-color problem-color]
   (let [b (:buffer v)
         n (ui/buffer-line-count b)
-        hl {:view v :lang lang :match-color match-color
+        hl {:view v :lang lang :match-color match-color :problem-color problem-color
             :states (atom (into [(:initial-state lang)] (repeat n nil)))
-            :extra (atom {:match nil})}]
+            :extra (atom {:match nil :problems []})}]
     ;; Color it all, one line after another.
     (let [runs (loop [l 0 state (:initial-state lang) runs (transient [])]
                  (if (< l n)
@@ -144,7 +163,7 @@ highlighter."
                    (when (< p (ui/buffer-length b))
                      (let [l (ui/position-line b p)] (relex! hl l l))))))))
     (ui/on v :selection-changed (fn [_] (show-match! hl)))
-    hl))
+    hl)))
 
 (defn top-level-form
   "[start end] of the top-level form around position, or of the last one before it, or

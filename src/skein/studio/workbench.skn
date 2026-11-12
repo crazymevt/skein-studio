@@ -23,6 +23,9 @@ commands here are what its menus do, and what tests call.
             [skein.studio.lang.skein :as sk]
             [skein.studio.inferior :as inferior]
             [skein.studio.repl :as repl]
+            [skein.studio.debugger :as debugger]
+            [skein.studio.inspector :as inspector]
+            [skein.studio.problems :as problems]
             [skein.swank.client :as swank]))
 
 ;;; State
@@ -321,6 +324,16 @@ Returns true if it closed."
     (ui/insert-into-buffer! b (ui/buffer-length b) text)
     (ui/scroll-to-position! v (ui/buffer-length b))))
 
+(defn show-panel!
+  "Show the panel page in the panels below the editors."
+  [wb page]
+  (let [n (:panels wb)
+        i (first (keep-indexed (fn [i c] (when (identical? c page) i)) (:children n)))]
+    (when i (set-slot! n :selected-index i))))
+
+(def ^:private goto-location!
+  "Show a Swank location in an editor (defined below).")
+
 (defn handle-swank-event!
   "Act on an event from the program's Swank."
   [wb e]
@@ -329,6 +342,11 @@ Returns true if it closed."
     :new-package (repl/set-prompt! (:repl wb) (str (:prompt e) "=> "))
     :disconnected (do (swap! (:state wb) dissoc :inferior)
                       (message! wb (str "The program's Swank disconnected: " (:reason e))))
+    :debug (do (debugger/debug! (:debugger wb) e)
+               (show-panel! wb (:widget (:debugger wb)))
+               (message! wb (str "Error: " (first (:condition e)))))
+    :debug-activate (show-panel! wb (:widget (:debugger wb)))
+    :debug-return (debugger/debug-return! (:debugger wb) e)
     nil))
 
 (defn stop-program!
@@ -400,6 +418,9 @@ Skein file, and connect to it."
     (when-let [hl (:highlighter (:view ed))]
       (highlight/top-level-form hl (:cursor (:view ed))))))
 
+(def ^:private set-compile-problems!
+  "Keep a compilation's notes as the file's compile problems (defined with problems).")
+
 (defn eval-form!
   "Evaluate the top-level form at the caret in the program, and show its value."
   [wb]
@@ -435,7 +456,8 @@ Skein file, and connect to it."
                                       (:path (:document ed)) line (ui/position-column b s)
                                       (request-opts ed))
                                      120))
-                  (fn [r] (message! wb (compile-result-message r "Compiled the form")))))))))
+                  (fn [r] (set-compile-problems! wb (:path (:document ed)) r)
+                    (message! wb (compile-result-message r "Compiled the form")))))))))
 
 (defn eval-file!
   "Save the active file and load it into the program."
@@ -459,8 +481,164 @@ Skein file, and connect to it."
         (save-editor! wb ed)
         (let [path (:path (:document ed))]
           (async! (fn [] (swank/call (swank/compile-file conn path) 120))
-                  (fn [r] (message! wb (compile-result-message
-                                        r (str "Compiled " (io/file-name path)))))))))))
+                  (fn [r] (set-compile-problems! wb path r)
+                    (message! wb (compile-result-message
+                                  r (str "Compiled " (io/file-name path)))))))))))
+
+;;; The debugger, the inspector and definitions
+
+(defn- location-position
+  "The position in the text buffer b of a line (from 1) and column (from 0)."
+  [b line column]
+  (let [l (max 0 (min (dec (ui/buffer-line-count b)) (dec line)))]
+    (min (+ (ui/line-start b l) (max 0 column)) (ui/line-end b l))))
+
+(defn goto-location!
+  "Show a Swank location, (:location (:file f) (:line l c) ...), in its editor, with the
+caret there. Returns the editor, or nil."
+  [wb loc]
+  (let [at (problems/parse-location loc)
+        ed (cond (nil? at) nil
+                 (:file at) (when (io/file? (:file at)) (open-file! wb (:file at)))
+                 (:buffer at) (first (filter (fn [ed] (= (:buffer at)
+                                                         (docs/document-name (:document ed))))
+                                             (editors wb))))]
+    (if-not ed
+      (message! wb (str "No source to show: " (if (and (sequential? loc) (= :error (first loc)))
+                                                (second loc)
+                                                (pr-str loc))))
+      (let [v (:view ed)
+            p (location-position (:buffer v) (:line at) (:column at))]
+        (ui/select-page! (:tabs wb) v)
+        (ui/set-cursor! v p)
+        (ui/scroll-to-position! v p)
+        (ui/focus! v)
+        ed))))
+
+(defn- request!
+  "If there is a program, call (f conn) on a fiber, then (done r) on the UI's thread with
+{:value v} or {:error e}."
+  [wb f done]
+  (with-program wb (fn [conn] (async! (fn [] (f conn)) done))))
+
+(defn- debugger-actions [wb]
+  {:restart (fn [thread level i]
+              (request! wb (fn [conn]
+                             (swank/call (swank/invoke-nth-restart conn thread level i) 60))
+                        (fn [r] nil)))
+   :show-frame (fn [thread i]
+                 (request! wb (fn [conn]
+                                (swank/call (swank/frame-source-location conn thread i) 10))
+                           (fn [r] (if (contains? r :value)
+                                     (goto-location! wb (:value r))
+                                     (message! wb (reason (:error r)))))))
+   :eval (fn [thread i text]
+           (request! wb (fn [conn] (swank/call (swank/eval-in-frame conn thread i text nil) 60))
+                     (fn [r] (debugger/show-result! (:debugger wb)
+                                                    (if (contains? r :value)
+                                                      (str (:value r))
+                                                      (reason (:error r)))))))})
+
+(defn- show-inspected! [wb r]
+  (if (contains? r :value)
+    (when-let [reply (:value r)]
+      (inspector/show! (:inspector wb) reply)
+      (show-panel! wb (:widget (:inspector wb))))
+    (message! wb (reason (:error r)))))
+
+(defn- inspector-actions [wb]
+  {:part (fn [i] (request! wb (fn [conn] (swank/call (swank/inspect-part conn i) 30))
+                           (fn [r] (show-inspected! wb r))))
+   :back (fn [] (request! wb (fn [conn] (swank/call (swank/inspector-pop conn) 30))
+                          (fn [r] (show-inspected! wb r))))})
+
+(defn inspect-form!
+  "Inspect the value of the selection, or of the top-level form at the caret."
+  [wb]
+  (with-program wb
+    (fn [conn]
+      (when-let [ed (active-editor wb)]
+        (let [v (:view ed)
+              [s e] (if (ui/selection-empty? v) (form-at-caret wb) (ui/selection v))]
+          (when s
+            (async! (fn [] (swank/call (swank/inspect conn (ui/buffer-text (:buffer v) s e)
+                                                      (request-opts ed))
+                                       60))
+                    (fn [r] (show-inspected! wb r)))))))))
+
+(defn symbol-at-caret
+  "The symbol the active editor's caret is in or just after, or nil."
+  [wb]
+  (when-let [ed (active-editor wb)]
+    (let [v (:view ed)
+          text (ui/code-text v)
+          word? (fn [c] (not (contains? (set " \t\n()[]{}\"'`,;@^~") c)))
+          p (:cursor v)
+          start (loop [i p] (if (and (pos? i) (word? (nth text (dec i)))) (recur (dec i)) i))
+          end (loop [i p] (if (and (< i (count text)) (word? (nth text i))) (recur (inc i)) i))]
+      (when (< start end) (subs text start end)))))
+
+(defn goto-definition!
+  "Show where the symbol at the caret is defined, as the program knows it."
+  [wb]
+  (with-program wb
+    (fn [conn]
+      (if-let [nm (symbol-at-caret wb)]
+        (let [ed (active-editor wb)]
+          (async! (fn [] (swank/call (swank/find-definitions conn nm (request-opts ed)) 10))
+                  (fn [r] (let [[[_ loc]] (when (sequential? (:value r)) (vec (:value r)))]
+                            (if loc
+                              (goto-location! wb loc)
+                              (message! wb (str "No definition of " nm " found")))))))
+        (message! wb "No symbol at the caret")))))
+
+;;; Problems: read errors, found by reading a Skein file soon after it changes, and the
+;;; compiler's notes; listed in the Problems panel and underlined in the editors.
+
+(defn all-problems
+  "Every problem known, by file and line."
+  [wb]
+  (vec (sort-by (fn [p] [(:file p) (:line p) (:column p)])
+                (mapcat (fn [[_ by-source]] (mapcat val by-source)) (:problems (state wb))))))
+
+(defn- problem-range [ed p]
+  (let [v (:view ed)
+        b (:buffer v)
+        start (location-position b (:line p) (:column p))
+        token (when-let [hl (:highlighter v)]
+                (first (filter (fn [[s e]] (and (<= s start) (< start e)))
+                               (highlight/tokens-of hl (ui/position-line b start)))))]
+    [start (if token (second token) (min (ui/buffer-length b) (inc start)))]))
+
+(defn refresh-problems!
+  "Show the problems in the Problems panel and the editors."
+  [wb]
+  (let [ps (all-problems wb)]
+    (swap! (:state wb) assoc :problem-list ps)
+    (set-slot! (:problems-list wb) :items (mapv (fn [p] (problems/describe p io/file-name)) ps))
+    (doseq [ed (editors wb)]
+      (when-let [hl (:highlighter (:view ed))]
+        (highlight/set-problems! hl (mapv (fn [p] (problem-range ed p))
+                                          (filter (fn [p] (= (:file p) (:path (:document ed))))
+                                                  ps)))))))
+
+(defn- set-problems-of! [wb path source ps]
+  (swap! (:state wb) assoc-in [:problems path source] (vec ps))
+  (refresh-problems! wb))
+
+(defn set-compile-problems! [wb path r]
+  (set-problems-of! wb path :compile (when (contains? r :value)
+                                       (problems/compile-problems (:value r) path))))
+
+(defn check-reading!
+  "Read the editor's Skein text, soon, for read errors."
+  [wb ed]
+  (let [path (:path (:document ed))]
+    (when (= "skn" (io/extension path))
+      (let [text (ui/buffer-text (:buffer (:view ed)))]
+        (async! (fn [] (problems/read-problems path text))
+                (fn [r] (when (and (contains? r :value) (editor-for wb path))
+                          (set-problems-of! wb path :read (:value r)))))))))
 
 ;;; Help while typing, from the program: the argument list of the form the caret is in,
 ;;; in the status bar, and completions of the symbol being typed.
@@ -516,8 +694,10 @@ characters or more."
     (ui/on v :selection-changed (fn [_] (schedule! wb :arglist 0.3 (fn [] (show-arglist! wb)))))
     (ui/on (:buffer v) :changed
            (fn [e]
+             (schedule! wb [:read (:path (:document ed))] 0.5 (fn [] (check-reading! wb ed)))
              (when (and (pos? (count (:inserted-text e))) (not (:accepting (state wb))))
-               (schedule! wb :complete 0.25 (fn [] (offer-completions! wb ed))))))))
+               (schedule! wb :complete 0.25 (fn [] (offer-completions! wb ed))))))
+    (check-reading! wb ed)))
 
 ;;; Menus
 
@@ -548,7 +728,10 @@ characters or more."
       (item "Evaluate Form" "Primary+Return" (fn [] (eval-form! wb)))
       (item "Compile Form" "Primary+K" (fn [] (compile-form! wb)))
       (item "Load File" "Primary+Shift+Return" (fn [] (eval-file! wb)))
-      (item "Compile File" "Primary+Shift+K" (fn [] (compile-file! wb))))
+      (item "Compile File" "Primary+Shift+K" (fn [] (compile-file! wb)))
+      (ui/menu-separator)
+      (item "Inspect Form" "Primary+I" (fn [] (inspect-form! wb)))
+      (item "Go to Definition" "Alt+." (fn [] (goto-definition! wb))))
     (ui/menu {:title "View"}
       (item "Studio Dark" nil (fn [] (apply-theme! wb "studio-dark")))
       (item "Studio Light" nil (fn [] (apply-theme! wb "studio-light"))))))
@@ -582,7 +765,19 @@ shown. opts: :size [width height]."
                                     (first (swank/call (swank/completions (:conn inf) prefix) 5))
                                     [])))
          popup (ui/completion-popup {:max-visible-rows 10})
-         panels (ui/notebook {} (doto (:widget repl-panel) (set-slot! :tab-label "REPL")) output)
+         ;; The panels' actions need the workbench, made after them: they find it when called.
+         late (fn [actions k] (fn [& args] (apply (get (actions @wb-ref) k) args)))
+         dbg (debugger/install! (debugger/make-debugger
+                                 {:restart (late debugger-actions :restart)
+                                  :show-frame (late debugger-actions :show-frame)
+                                  :eval (late debugger-actions :eval)}))
+         insp (inspector/make-inspector {:part (late inspector-actions :part)
+                                         :back (late inspector-actions :back)})
+         problems-list (ui/list-box {:items [] :vexpand true :tab-label "Problems"})
+         panels (ui/notebook {} (doto (:widget repl-panel) (set-slot! :tab-label "REPL")) output
+                             (doto (:widget dbg) (set-slot! :tab-label "Debugger"))
+                             (doto (:widget insp) (set-slot! :tab-label "Inspector"))
+                             problems-list)
          window (ui/window {:title "Skein Studio" :width width :height height
                             :appearance (:appearance theme)
                             :palette (themes/widget-palette theme)}
@@ -594,8 +789,13 @@ shown. opts: :size [width height]."
                     (ui/hbox {:padding [3 10] :spacing 12 :surface :status}
                              message hint position)))
          wb {:window window :tree tree :tabs tabs :message message :position position
-             :hint hint :output output :repl repl-panel :popup popup :state st}]
+             :hint hint :output output :repl repl-panel :popup popup :state st
+             :debugger dbg :inspector insp :problems-list problems-list :panels panels}]
      (reset! wb-ref wb)
+     (ui/on problems-list :row-activated
+            (fn [e] (when-let [p (get (:problem-list @st) (:index e))]
+                      (goto-location! wb (list :location (list :file (:file p))
+                                               (list :line (:line p) (:column p)) nil)))))
      ;; A completion chosen replaces the symbol being typed.
      (ui/on popup :accept
             (fn [e]

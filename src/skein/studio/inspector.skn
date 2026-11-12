@@ -1,0 +1,54 @@
+(ns skein.studio.inspector
+  "The inspector panel (Skein's D-109): the program's Swank describes a value as a title
+and content mixing text with its parts; the panel shows the content as rich text whose
+parts are links, and clicking one inspects it. Back goes to the value inspected before."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]))
+
+(defn- part-href [i] (str "part:" i))
+
+(defn content-blocks
+  "Swank's inspector content (strings, (:value label index), (:action label index) and
+(:newline)) as rich text paragraphs, a part a link to part:index."
+  [content]
+  (let [lines (reduce (fn [lines item]
+                        (cond
+                          (string? item)
+                          (let [[first-piece & more] (string/split item #"\n" -1)]
+                            (into (update lines (dec (count lines)) conj first-piece)
+                                  (map (fn [piece] [piece]) more)))
+                          (and (sequential? item) (= :newline (first item)))
+                          (conj lines [])
+                          (and (sequential? item) (contains? #{:value :action} (first item)))
+                          (let [[_ label i] item]
+                            (update lines (dec (count lines)) conj
+                                    [:a {:href (part-href i)} (str label)]))
+                          :else (update lines (dec (count lines)) conj (str item))))
+                      [[]] content)]
+    (mapv (fn [inline] (into [:p] (remove (fn [x] (= "" x)) inline)))
+          (remove empty? (map (fn [l] (vec (remove (fn [x] (= "" x)) l))) lines)))))
+
+(defn make-inspector
+  "An inspector panel: {:widget ...}. actions: :part (index) and :back ()."
+  [actions]
+  (let [title (ui/label {:text "Nothing inspected" :hexpand true})
+        back (ui/button {:label "Back"})
+        body (ui/rich-text {:content [] :vexpand true})
+        p {:widget (ui/vbox {:padding 8 :spacing 6}
+                     (ui/hbox {:spacing 8} back title)
+                     body)
+           :title title :body body :back back :actions actions}]
+    (ui/on body :link-activated
+           (fn [e] (when-let [[_ i] (re-find #"^part:(\d+)$" (:href e))]
+                     ((:part actions) (parse-long i)))))
+    (ui/on back :clicked (fn [_] ((:back actions))))
+    p))
+
+(defn show!
+  "Show an inspector reply, (:title t :id i :content (content length start end))."
+  [p reply]
+  (let [m (apply hash-map reply)
+        [content] (:content m)]
+    (set-slot! (:title p) :text (str (:title m)))
+    (set-slot! (:body p) :content (content-blocks content))
+    p))

@@ -12,7 +12,10 @@
             [skein.studio.inferior :as inferior]
             [skein.studio.repl :as repl]
             [skein.studio.workbench :as wb]
-            [skein.process :as process]))
+            [skein.process :as process]
+            [skein.studio.debugger :as debugger]
+            [skein.studio.inspector :as inspector]
+            [skein.studio.problems :as problems]))
 
 ;; Running the program (Skein's M3.7 step 3, D-109): the REPL panel, the form at the caret,
 ;; and a project run under a real skein dev, driven through Swank.
@@ -115,7 +118,8 @@
     (io/write-file (io/path root "project.skn") "{:name \"app\" :main app.main/-main}\n")
     (io/make-dirs (io/parent main))
     (io/write-file main (str "(ns app.main)\n\n(defn add\n  \"Adds.\"\n  [a b]\n  (+ a b))\n\n"
-                             "(add 2 3)\n\n(defn -main [& args]\n  (println \"started\"))\n"))
+                             "(add 2 3)\n\n(defn boom []\n  (error \"kaboom\"))\n\n"
+                             "(defn -main [& args]\n  (println \"started\"))\n"))
     (let [w (wb/make-workbench)]
       (ui/show! (:window w))
       (wb/open-folder! w root)
@@ -154,10 +158,108 @@
             (wb/offer-completions! w (wb/active-editor w))
             (is (wait-for 30 (fn [] (and (:shown (:popup w))
                                          (some #{"add"} (:items (:popup w)))))))))
+        (testing "an error in the debugger: its frames, evaluating in one, a restart"
+          (let [v (:view (wb/active-editor w))
+                d (:debugger w)]
+            ;; The file again, without what the tests above typed, and forms typed after the
+            ;; program started, not in the file it loaded.
+            (ui/set-buffer-text! (:buffer v)
+                                 (str (io/read-file main) "\n(boom)\n\n(no-such-fn 1)\n"))
+            (ui/set-cursor! v (+ 1 (string/index-of (ui/code-text v) "(boom)")))
+            (wb/eval-form! w)
+            (is (wait-for 30 (fn [] (debugger/current d))))
+            (when-let [e (debugger/current d)]
+              (is (string/includes? (first (:condition e)) "kaboom"))
+              (is (seq (:frames e)))
+              (is (some (fn [[nm _]] (= "abort" nm)) (:restarts e)))
+              (is (string/includes? (:text (:condition d)) "kaboom"))
+              (set-slot! (:eval-entry d) :text "(+ 1 1)")
+              (ui/emit! (:eval-entry d) (ui/event-for (:eval-entry d) :activate))
+              (is (wait-for 30 (fn [] (= "=> 2" (:text (:result d))))) (:text (:result d)))
+              (let [abort (first (keep-indexed (fn [i [nm _]] (when (= "abort" nm) i))
+                                               (:restarts e)))]
+                (ui/row-activated-by-user! (:restarts d) abort)
+                (is (wait-for 30 (fn [] (nil? (debugger/current d))))
+                    "the debugger closes when the restart runs")))))
+        (testing "the inspector"
+          (let [v (:view (wb/active-editor w))
+                text (ui/code-text v)
+                at (string/index-of text "(add 2 3)")]
+            (ui/set-selection! v at (+ at 9))
+            (wb/inspect-form! w)
+            (is (wait-for 30 (fn [] (= "5" (:text (:title (:inspector w)))))))
+            (ui/set-cursor! v 0)))
+        (testing "going to a definition"
+          (let [v (:view (wb/active-editor w))
+                text (ui/code-text v)]
+            (ui/set-cursor! v (+ 2 (string/index-of text "(add 2 3)")))
+            (wb/goto-definition! w)
+            (is (wait-for 30 (fn [] (= (string/index-of text "(defn add") (:cursor v)))))))
+        (testing "a compiler note is a problem, underlined"
+          (let [v (:view (wb/active-editor w))
+                text (ui/code-text v)]
+            (ui/set-cursor! v (+ 1 (string/index-of text "(no-such-fn 1)")))
+            (wb/compile-form! w)
+            (is (wait-for 30 (fn [] (some (fn [p] (= :compile (:source p))) (wb/all-problems w)))))
+            (is (some (fn [[_ _ a]] (:underline a)) (ui/text-runs v)))))
         (testing "stopping it"
           (let [p (:process (wb/inferior w))]
             (wb/stop-program! w)
             (is (not (wb/connected? w)))
             (is (wait-for 10 (fn [] (not (process/alive? p))))))))
+      (headless/answer! 1)
+      (ui/close! (:window w)))))
+
+(deftest problems-and-panels
+  (testing "read errors"
+    (let [[p] (problems/read-problems "/x/a.skn" "(ns a)\n\n(defn f [x]\n  (g x)")]
+      (is (= ["/x/a.skn" :read] [(:file p) (:source p)]))
+      (is (seq (:message p))))
+    (is (= [] (problems/read-problems "/x/a.skn" "(ns a)"))))
+  (testing "Swank's locations and notes"
+    (is (= {:file "/a.skn" :buffer nil :line 3 :column 4}
+           (problems/parse-location '(:location (:file "/a.skn") (:line 3 4) nil))))
+    (is (nil? (problems/parse-location '(:error "no location"))))
+    (is (= [{:file "/a.skn" :line 2 :column 0 :message "bad" :severity :error :source :compile}]
+           (problems/compile-problems
+            '(:compilation-result ((:message "bad" :severity :error
+                                    :location (:location (:buffer "a.skn") (:line 2 0) nil)
+                                    :references nil))
+              false 0.0 nil nil)
+            "/a.skn"))))
+  (testing "the inspector's content as rich text"
+    (is (= [[:p "Class: " [:a {:href "part:0"} "map"]] [:p "Count: 1"]
+            [:p [:a {:href "part:1"} ":a"] " = " [:a {:href "part:2"} "1"]]]
+           (inspector/content-blocks ["Class: " '(:value "map" 0) "\n" "Count: 1\n\n"
+                                      '(:value ":a" 1) " = " '(:value "1" 2) "\n"]))))
+  (testing "the debugger's levels stack"
+    (let [d (debugger/make-debugger {})]
+      (debugger/debug! d {:thread 1 :level 1 :condition ["one" "error"] :restarts [] :frames []})
+      (debugger/debug! d {:thread 1 :level 2 :condition ["two" "error"] :restarts [] :frames []})
+      (is (= "two  [error]" (:text (:condition d))))
+      (debugger/debug-return! d {:thread 1 :level 2})
+      (is (= "one  [error]" (:text (:condition d))))
+      (debugger/debug-return! d {:thread 1 :level 1})
+      (is (= "No error" (:text (:condition d))))))
+  (testing "the workbench underlines a read error, and stops when it's fixed"
+    (let [root (io/temp-dir "studio-problems")
+          f (io/path root "a.skn")
+          w (wb/make-workbench)]
+      (io/write-file f "(ns a)\n\n(defn f [x]\n  (g x))\n")
+      (ui/show! (:window w))
+      (wb/open-folder! w root)
+      (let [ed (wb/open-file! w (io/path (wb/folder w) "a.skn"))
+            b (:buffer (:view ed))]
+        (is (wait-for 5 (fn [] true)))
+        (is (empty? (wb/all-problems w)))
+        (ui/delete-buffer-range! b (dec (ui/buffer-length b)) (ui/buffer-length b))
+        (ui/delete-buffer-range! b (dec (ui/buffer-length b)) (ui/buffer-length b))
+        (is (wait-for 10 (fn [] (seq (wb/all-problems w)))))
+        (is (= [(problems/describe (first (wb/all-problems w)) io/file-name)]
+               (:items (:problems-list w))))
+        (is (some (fn [[_ _ a]] (:underline a)) (ui/text-runs (:view ed))))
+        (ui/insert-into-buffer! b (ui/buffer-length b) ")")
+        (is (wait-for 10 (fn [] (empty? (wb/all-problems w)))))
+        (is (not (some (fn [[_ _ a]] (:underline a)) (ui/text-runs (:view ed))))))
       (headless/answer! 1)
       (ui/close! (:window w)))))

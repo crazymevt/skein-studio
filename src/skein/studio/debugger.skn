@@ -1,0 +1,90 @@
+(ns skein.studio.debugger
+  "The debugger panel (Skein's D-109), from the program's Swank debug events: the
+condition, its restarts and the backtrace. Activating a restart invokes it, activating a
+frame shows its source, and an entry evaluates text in the selected frame. Nested errors
+stack: when one level returns, the one under it shows again."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]))
+
+(defn make-debugger
+  "A debugger panel: {:widget ...}. actions are functions the panel calls: :restart
+(thread level index), :show-frame (thread index) and :eval (thread index text), which
+gives the value's text (on a fiber of its own)."
+  [actions]
+  (let [condition (ui/label {:text "No error" :wrap true :hexpand true})
+        restarts (ui/list-box {:items [] :vexpand true})
+        frames (ui/list-box {:items [] :vexpand true})
+        eval-entry (ui/entry {:placeholder "Evaluate in the selected frame" :hexpand true})
+        result (ui/label {:text "" :text-color :secondary-text :selectable true})
+        d {:widget (ui/vbox {:padding 8 :spacing 6}
+                     condition
+                     (ui/label {:text "Restarts" :text-color :secondary-text})
+                     restarts
+                     (ui/label {:text "Backtrace" :text-color :secondary-text})
+                     frames
+                     (ui/hbox {:spacing 6} eval-entry)
+                     result)
+           :condition condition :restarts restarts :frames frames :eval-entry eval-entry
+           :result result :stack (atom []) :actions actions}]
+    d))
+
+(defn current
+  "The debug event the panel shows, or nil."
+  [d]
+  (peek @(:stack d)))
+
+(defn- show! [d]
+  (if-let [e (current d)]
+    (let [[message type] (:condition e)]
+      (set-slot! (:condition d) :text (str message (when type (str "  [" type "]"))))
+      (set-slot! (:restarts d) :items
+                 (vec (map-indexed (fn [i [nm desc]] (str i ": " nm " — " desc)) (:restarts e))))
+      (set-slot! (:frames d) :items (mapv (fn [[i text]] (str i ": " text)) (:frames e))))
+    (do (set-slot! (:condition d) :text "No error")
+        (set-slot! (:restarts d) :items [])
+        (set-slot! (:frames d) :items [])))
+  (set-slot! (:result d) :text "")
+  d)
+
+(defn debug!
+  "Show a :debug event (a new level of a thread's debugger)."
+  [d e]
+  (swap! (:stack d) (fn [st] (conj (filterv (fn [x] (not (and (= (:thread x) (:thread e))
+                                                                 (>= (:level x) (:level e)))))
+                                            st)
+                                   e)))
+  (show! d))
+
+(defn debug-return!
+  "A thread's debugger left a level (:debug-return): stop showing it and what is above it."
+  [d e]
+  (swap! (:stack d) (fn [st] (filterv (fn [x] (not (and (= (:thread x) (:thread e))
+                                                         (>= (:level x) (:level e)))))
+                                      st)))
+  (show! d))
+
+(defn selected-frame
+  "The index of the frame selected in the backtrace, or 0."
+  [d]
+  (or (first (:selected-indices (:frames d))) 0))
+
+(defn install!
+  "Connect the panel's widgets to its actions. Returns the panel."
+  [d]
+  (let [{:keys [restart show-frame eval]} (:actions d)]
+    (ui/on (:restarts d) :row-activated
+           (fn [e] (when-let [x (current d)] (restart (:thread x) (:level x) (:index e)))))
+    (ui/on (:frames d) :row-activated
+           (fn [e] (when-let [x (current d)] (show-frame (:thread x) (:index e)))))
+    (ui/on (:eval-entry d) :activate
+           (fn [_]
+             (when-let [x (current d)]
+               (let [text (string/trim (:text (:eval-entry d)))]
+                 (when (seq text)
+                   (eval (:thread x) (selected-frame d) text)))))))
+  d)
+
+(defn show-result!
+  "Show the value of an evaluation in a frame (Swank's text, as \"=> 2\")."
+  [d text]
+  (set-slot! (:result d) :text (str text)))

@@ -1,0 +1,51 @@
+(ns skein.studio.problems
+  "Problems (Skein's D-109): read errors, from reading a file with Skein's reader as it
+changes, and the compiler's notes, from compiling a form or a file in the program. A
+problem is a map: :file, :line (from 1), :column (from 0), :message, :severity and
+:source (:read or :compile). Swank's locations are read here too."
+  (:require [skein.compiler.reader :as reader]))
+
+(defn read-problems
+  "The problems of reading text, the file at path: its first read error, or none."
+  [path text]
+  (try (reader/read-string-forms text {:file path :namespace "user"
+                                       :resolve-alias (fn [a] a)})
+       []
+       (catch reader/read-error e
+         (let [loc (reader/read-error-location e)]
+           [{:file path :line (or (:line loc) 1) :column (max 0 (dec (or (:column loc) 1)))
+             :message (reader/read-error-message e) :severity :error :source :read}]))))
+
+(defn- plist [xs] (when (sequential? xs) (apply hash-map xs)))
+
+(defn parse-location
+  "A Swank location, (:location (:file f) (:line l c) hints) or (:location (:buffer b)
+...), as {:file :buffer :line :column} (line from 1, column from 0), or nil for an
+(:error ...)."
+  [loc]
+  (when (and (sequential? loc) (= :location (first loc)))
+    (let [[_ where pos] loc
+          [line column] (when (and (sequential? pos) (= :line (first pos))) (rest pos))]
+      {:file (when (= :file (first where)) (second where))
+       :buffer (when (= :buffer (first where)) (second where))
+       :line (or line 1)
+       :column (or column 0)})))
+
+(defn compile-problems
+  "The problems in a compilation result, (:compilation-result notes ...), for file (whose
+notes may name it as a buffer)."
+  [result file]
+  (let [[_ notes] (when (sequential? result) (vec result))]
+    (vec (keep (fn [note]
+                 (let [n (plist note)
+                       at (parse-location (:location n))]
+                   (when at
+                     {:file (or (:file at) file) :line (:line at) :column (:column at)
+                      :message (str (:message n)) :severity (or (:severity n) :error)
+                      :source :compile})))
+               notes))))
+
+(defn describe
+  "A problem as a line of the Problems panel."
+  [p file-name]
+  (str (file-name (:file p)) ":" (:line p) ": " (:message p)))
