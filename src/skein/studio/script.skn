@@ -7,9 +7,18 @@ Steps: [:open-folder path] [:open-file path] (relative to the folder) [:append t
 (typed at the end of the active editor) [:caret-in text] [:command title] [:run-program]
 [:repl text] [:restart name] [:snapshot name] [:expect-text text] [:expect-style text
 style] and [:wait what arg secs], what one of :connected, :output, :message, :repl,
-:debugger and :no-debugger."
+:debugger and :no-debugger.
+
+The agent panel's (Skein's M3.8 step 6, D-110), with opts' :panel: [:agent id script]
+shows agent id (\"claude\" or \"codex\") with tools/stand-in.skn playing script as its CLI
+and autonomy :ask, so requests show; [:agent-send text] types text in the composer and
+clicks Send; [:agent-click label] clicks one of the panel's buttons (a request's); and
+[:wait what arg secs] waits for :agent-idle, :agent-busy, :agent-request or :agent-text
+(the chat has arg)."
   (:require [skein.ui :as ui]
             [skein.io :as io]
+            [skein.studio.inferior :as inferior]
+            [skein.studio.agents.panel :as panel]
             [skein.edn :as edn]
             [skein.string :as string]
             [skein.studio.workbench :as wb]
@@ -36,10 +45,26 @@ the editor's own handling, the rest as text input (pairs, typing over closers)."
   (when-not ok (error what))
   true)
 
+(def ^:private stand-in
+  ;; tools/stand-in.skn, built when a script first uses it
+  (delay (let [out (io/path (io/temp-dir "stand-in") "stand-in")
+               r (io/run-process [(io/path (inferior/skein-home) "build/skeinc") "build"
+                                  (io/absolute-path "tools/stand-in.skn") "-o" out])]
+           (when-not (zero? (:exit r))
+             (error (str "building the stand-in failed: " (:err r) (:out r))))
+           out)))
+
+(defn- the-panel [opts]
+  (or (:panel opts) (error "the script has no agent panel")))
+
 (defn- condition-met?
   "Whether the condition of a :wait step holds now."
-  [w what arg]
+  [w what arg opts]
   (case what
+    :agent-idle (= :idle (panel/agent-status (the-panel opts)))
+    :agent-busy (= :busy (panel/agent-status (the-panel opts)))
+    :agent-request (boolean (seq (panel/open-requests (the-panel opts))))
+    :agent-text (string/includes? (panel/chat-text (the-panel opts)) arg)
     :connected (wb/connected? w)
     :output (string/includes? (ui/code-text (:output w)) arg)
     :message (string/includes? (str (:text (:message w))) arg)
@@ -76,6 +101,18 @@ folders are), :snapshots (a folder for pictures)."
                      i (first (keep-indexed (fn [i [nm _]] (when (= a nm) i)) (:restarts e)))]
                  (check i (str "no restart " a))
                  (ui/row-activated-by-user! (:restarts d) i))
+      :agent (let [p (the-panel opts)
+                   program [@stand-in (io/absolute-path b)]]
+               (panel/use-program! p a program)
+               (panel/set-autonomy! p :ask)
+               (wb/show-right! w)
+               (panel/select-agent! p a))
+      :agent-send (let [p (the-panel opts)
+                        v (:composer p)]
+                    (ui/set-cursor! v (ui/text-length v))
+                    (ui/type-text! v a)
+                    (check (panel/click! p "Send") "no Send button"))
+      :agent-click (check (panel/click! (the-panel opts) a) (str "no button " (pr-str a)))
       :snapshot (when-let [dir (:snapshots opts)]
                   (io/write-bytes (io/path dir (str a ".png")) (ui/snapshot (:window w))))
       :expect-text (check (string/includes? (ui/code-text (active-view w)) a)
@@ -102,12 +139,15 @@ called with a line for each step. Returns {:ok true}, or {:ok false :step s :rea
                           secs (or (if (number? arg) arg secs) 30)
                           arg (when-not (number? arg) arg)]
                       (loop [n 0]
-                        (cond (on-ui (fn [] (condition-met? w what arg))) nil
+                        (cond (on-ui (fn [] (condition-met? w what arg opts))) nil
                               (>= n (* 10 secs))
                               (error (str "waited " secs " s; the status bar says "
                                           (pr-str (on-ui (fn [] (:text (:message w)))))))
                               :else (do (pump) (recur (inc n))))))
-                    (do (on-ui (fn [] (run-step! w step opts)))
+                    (do (when (= :agent (first step))
+                          ;; built here, on the script's fiber, not the UI's thread
+                          @stand-in)
+                        (on-ui (fn [] (run-step! w step opts)))
                         (pump)))
                   nil
                   (catch error e (or (ex-message e) (str e))))]

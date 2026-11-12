@@ -13,7 +13,8 @@
                                            {"value" "sonnet" "displayName" "Sonnet"
                                             "resolvedModel" "claude-sonnet-5-5"}]}}}]
  [:send {"type" "system" "subtype" "init" "session_id" "s-1"}]
- [:expect {"type" "user" "message.content" "hi"}]
+ ;; a message (with whatever context the IDE adds)
+ [:expect {"type" "user" "message.role" "user"}]
  [:send {"type" "user" "isReplay" true "uuid" "$last.uuid"}]
  [:send {"type" "control_request" "request_id" "mcp-0"
          "request" {"subtype" "mcp_message"

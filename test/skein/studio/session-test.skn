@@ -8,7 +8,8 @@
             [skein.studio.settings :as settings]
             [skein.studio.documents :as docs]
             [skein.studio.workbench :as wb]
-            [skein.studio.script :as script]))
+            [skein.studio.script :as script]
+            [skein.studio.agents.panel :as panel]))
 
 ;; The scripted session (Skein's M3.7 step 6, D-109): examples/session.edn run against the
 ;; IDE on the platform's own widgets, Cocoa on macOS and GTK where it can open a display,
@@ -31,12 +32,13 @@
   (ui/use-backend! backend)
   (binding [settings/*config-dir* (io/temp-dir "studio-config")]
     (settings/load-settings!)
-    (let [w (wb/make-workbench)]
+    (let [w (wb/make-workbench)
+          p (panel/install! w)]
       (ui/show! (:window w))
       (run-for! 0.2)
       (let [shots (system/getenv "SKEIN_STUDIO_SNAPSHOTS")
             r (script/run-script! w (script/read-script "examples/session.edn")
-                                  {:folder (copy-sample) :pump (fn [] (run-for! 0.1))
+                                  {:folder (copy-sample) :panel p :pump (fn [] (run-for! 0.1))
                                    :snapshots (when shots (io/make-dirs shots) shots)
                                    :log (fn [line] (println (str "; " label " " line)))})]
         (is (:ok r) (pr-str r)))

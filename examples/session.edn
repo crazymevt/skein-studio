@@ -1,7 +1,8 @@
 ;; Skein Studio's scripted session (Skein's M3.7 step 6, D-109): the steps
 ;; skein.studio.script runs against the IDE, as a user would work. It opens the sample
-;; project, runs it under skein dev, edits and evaluates, hits an error and restarts.
-;; ./studio --script examples/session.edn runs it, as does CI.
+;; project, runs it under skein dev, edits and evaluates, hits an error and restarts; then
+;; it works with Claude Code and Codex, stand-ins speaking each CLI's protocol (Skein's
+;; M3.8 step 6, D-110). ./studio --script examples/session.edn runs it, as does CI.
 [[:open-folder "examples/sample"]
  [:open-file "src/sample/main.skn"]
  [:expect-style "defn" :definer]
@@ -31,4 +32,23 @@
  [:repl "(add 40 2)"]
  [:wait :repl "42" 30]
  [:command "Stop Program"]
+ ;; Claude Code: a message, a command it asks to run, allowed, its reply and the IDE's
+ ;; tool it calls, answered.
+ [:agent "claude" "test/agents/claude-turn.edn"]
+ [:wait :agent-idle 120]
+ [:agent-send "hi"]
+ [:wait :agent-request 30]
+ [:agent-click "Allow"]
+ [:wait :agent-text "Hello" 30]
+ [:wait :agent-idle 30]
+ ;; Codex: a turn steered by a second message, a command allowed for the session.
+ [:agent "codex" "test/agents/codex-turn.edn"]
+ [:wait :agent-idle 60]
+ [:agent-send "hi"]
+ [:wait :agent-text "Hel" 30]
+ [:agent-send "and briefly"]
+ [:wait :agent-request 30]
+ [:agent-click "Allow for session"]
+ [:wait :agent-text "Command" 30]
+ [:wait :agent-idle 30]
  [:snapshot "session"]]

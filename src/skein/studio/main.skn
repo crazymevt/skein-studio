@@ -31,14 +31,15 @@ settings of its own, and exits with status 1 if a step fails."
       (if (= k :ok) v (error (or (ex-message v) (str v)))))))
 
 (defn- run-script
-  "Run the scripted session in file on the workbench wb, in the event loop; true if every
-step passed."
-  [wb file]
+  "Run the scripted session in file on the workbench wb (with its agent panel p), in the
+event loop; true if every step passed."
+  [wb p file]
   (let [result (atom nil)]
     (ui/show! (:window wb))
     (future
       (let [r (try (script/run-script! wb (script/read-script file)
-                                       {:base "." :on-ui on-ui :pump (fn [] (sleep 0.1))
+                                       {:base "." :panel p :on-ui on-ui
+                                        :pump (fn [] (sleep 0.1))
                                         :snapshots (system/getenv "SKEIN_STUDIO_SNAPSHOTS")
                                         :log (fn [line] (println (str "; " line)))})
                    (catch error e {:ok false :reason (or (ex-message e) (str e))}))]
@@ -55,10 +56,10 @@ step passed."
   (if-let [file (option args "--script")]
     (binding [settings/*config-dir* (io/temp-dir "studio-script")]
       (settings/load-settings!)
-      (let [wb (workbench/make-workbench)]
-        (agent-panel/install! wb)
+      (let [wb (workbench/make-workbench)
+            p (agent-panel/install! wb)]
         (ui/on (:window wb) :closed (fn [_] (ui/quit!)))
-        (if (run-script wb file)
+        (if (run-script wb p file)
           (println "; the scripted session passed")
           (error "the scripted session failed"))))
     (do (settings/load-settings!)

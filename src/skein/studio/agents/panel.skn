@@ -326,7 +326,7 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
   "Agent id's adapter, started now if it wasn't; nil if its CLI isn't installed."
   [p id]
   (or (adapter-of p id)
-      (let [program (get (:programs p) id)
+      (let [program (get-in (st p) [:programs id])
             provider (keyword id)]
         (if-not (or program (agents/find-cli provider))
           (do (notice! p (str "The " id " CLI isn't installed: install it and sign in, then "
@@ -355,6 +355,31 @@ Skein's, Run in REPL; entry i's code block k is skein-studio:<action>/<i>/<k>."
   (when-let [a (adapter-of p id)]
     (agents/stop! a)
     (agents/start! a)))
+
+(defn use-program!
+  "Run program (a path, or a program and its first arguments) as agent id's CLI from its
+next start, stopping the one running: a stand-in, say."
+  [p id program]
+  (when-let [a (adapter-of p id)]
+    (agents/stop! a)
+    (swap! (:state p) update :adapters dissoc id))
+  (swap! (:state p) assoc-in [:programs id] program))
+
+(defn agent-status
+  "The state of the agent shown: :starting, :idle, :busy, :error, :stopped."
+  [p]
+  (or (get-in (st p) [:status (active p)]) :stopped))
+
+(defn click!
+  "Click the panel's button labelled label (Send, Stop, or one of a request's), as the
+user would; false if there is none."
+  [p label]
+  (let [buttons (fn buttons [w] (if (instance? ui/button-widget w)
+                                  [w]
+                                  (mapcat buttons (or (:children w) []))))]
+    (if-let [b (first (filter (fn [b] (= label (:label b))) (buttons (:widget p))))]
+      (do (ui/emit! b (ui/event-for b :clicked)) true)
+      false)))
 
 (defn select-agent!
   "Show agent id (\"claude\" or \"codex\") and start it."
@@ -591,9 +616,10 @@ than the installed ones (tests give stand-ins)."
             :status-label status-label :model-box model-box :effort-box effort-box
             :autonomy-box autonomy-box :limits-label limits-label :requests-box requests-box
             :file-box file-box :selection-box selection-box :attachments-label attachments-label
-            :send-button send-button :stop-button stop-button :programs (:programs opts)
+            :send-button send-button :stop-button stop-button
             :state (atom {:active id :adapters {} :status {} :models {} :limits {} :usage {}
-                          :entries [] :requests {} :attachments []})}]
+                          :entries [] :requests {} :attachments []
+                          :programs (or (:programs opts) {})})}]
      (reset! p-ref p)
      (set-slot! composer :on-send (fn [] (send! p)))
      (set-slot! agent-box :selected-index (agent-index id))
