@@ -1,0 +1,36 @@
+(ns skein.studio.lang
+  "Languages (Skein's D-109): registered as Lisp Studio's are. A language is a map:
+:id and :name; :extensions, the file extensions it takes; :lex, a function of a line's
+text and the state it starts in giving [tokens end-state], each token [start end kind]
+or [start end kind depth] for a bracket; :initial-state; :style, a function of a token
+and the line's text giving a text style (or nil); :indent, a function of a text buffer
+and a line giving the column the line should start at; :line-comment; and :pairs, the
+characters typing inserts in pairs."
+  (:require [skein.io :as io]))
+
+(def ^:private registry (atom {}))
+
+(defn define-language!
+  "Register lang (a map, as the namespace says). Returns it."
+  [lang]
+  (swap! registry assoc (:id lang) lang)
+  lang)
+
+(def plain
+  "Text with no language: no tokens and no indentation rules."
+  {:id :plain :name "Plain Text" :extensions #{}
+   :lex (fn [text state] [[] state]) :initial-state nil
+   :style (fn [token text] nil)
+   :indent nil :line-comment nil :pairs {}})
+
+(defn languages
+  "The registered languages."
+  []
+  (vals @registry))
+
+(defn language-for
+  "The language of the file at path, by its extension, or plain text."
+  [path]
+  (let [ext (io/extension path)]
+    (or (first (filter (fn [l] (contains? (:extensions l) ext)) (languages)))
+        plain)))

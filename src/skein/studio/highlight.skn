@@ -1,0 +1,147 @@
+(ns skein.studio.highlight
+  "Incremental syntax coloring (Skein's D-109), as Lisp Studio's highlighter: the state
+each line of a code view's buffer starts in is kept, and when the buffer changes the lines
+from the first changed one are lexed again until one ends in the state the next already
+starts in, so typing costs a line or two however big the file is. The matching bracket of
+the one at the caret is shown on top of the tokens' styles."
+  (:require [skein.ui :as ui]))
+
+(defn- line-runs
+  "The runs of line l of the highlighter's buffer, lexed from state: [runs end-state]."
+  [hl l state]
+  (let [{:keys [view lang]} hl
+        b (:buffer view)
+        text (ui/line-text b l)
+        base (ui/line-start b l)
+        [tokens end] ((:lex lang) text state)
+        match (set (:match @(:extra hl)))
+        runs (persistent!
+              (reduce (fn [rs [s e :as token]]
+                        (let [style ((:style lang) token text)
+                              matched (contains? match (+ base s))]
+                          (if (or style matched)
+                            (conj! rs [(+ base s) (+ base e)
+                                       (cond-> {}
+                                         style (assoc :style style)
+                                         matched (assoc :background ((:match-color hl))))])
+                            rs)))
+                      (transient []) tokens))]
+    [runs end]))
+
+(defn- relex!
+  "Lex the lines from first, at least through last, and on until a line ends in the state
+the next starts in; record the states and replace those lines' runs."
+  [hl first-line last-line]
+  (let [b (:buffer (:view hl))
+        n (ui/buffer-line-count b)
+        states (:states hl)]
+    (loop [l first-line runs (transient [])]
+      (let [[line-rs end] (line-runs hl l (get @states l))
+            runs (reduce conj! runs line-rs)
+            settled (and (>= l last-line) (= end (get @states (inc l))))]
+        (swap! states assoc (inc l) end)
+        (if (or settled (>= (inc l) n))
+          (ui/replace-text-runs! (:view hl) (ui/line-start b first-line) (ui/line-end b l)
+                                 (persistent! runs))
+          (recur (inc l) runs))))))
+
+(defn- newlines [s] (count (filter (fn [c] (= c \newline)) s)))
+
+(defn tokens-of
+  "The tokens of line l, as the highlighter's states have it, positions in the buffer."
+  [hl l]
+  (let [b (:buffer (:view hl))
+        base (ui/line-start b l)
+        [tokens _] ((:lex (:lang hl)) (ui/line-text b l) (get @(:states hl) l))]
+    (mapv (fn [[s e & more]] (into [(+ base s) (+ base e)] more)) tokens)))
+
+(def ^:private scan-limit
+  "How many lines matching a bracket looks through."
+  3000)
+
+(defn matching-bracket
+  "[p q], the bracket next to the caret at position (the one before it if it closes, else
+the one after if it opens) and its partner, or nil."
+  [hl position]
+  (let [b (:buffer (:view hl))
+        line (ui/position-line b position)
+        here (tokens-of hl line)
+        at (fn [p kind] (first (filter (fn [[s _ k]] (and (= s p) (= k kind))) here)))
+        close (when (pos? position) (at (dec position) :close))
+        open (or (when-not close (at position :open))
+                 ;; #( and #{ before the caret
+                 (first (filter (fn [[s e k]] (and (= k :open) (< s position) (= e position)))
+                                here)))]
+    (cond
+      close
+      (let [[s _ _ depth] close]
+        (loop [l line limit scan-limit]
+          (when (and (>= l 0) (pos? limit))
+            (if-let [[p] (last (filter (fn [[ts _ k d]] (and (= k :open) (= d depth) (< ts s)))
+                                       (tokens-of hl l)))]
+              [s p]
+              (recur (dec l) (dec limit))))))
+      open
+      (let [[s _ _ depth] open
+            n (ui/buffer-line-count b)]
+        (loop [l line limit scan-limit]
+          (when (and (< l n) (pos? limit))
+            (if-let [[p] (first (filter (fn [[ts _ k d]] (and (= k :close) (= d depth) (> ts s)))
+                                        (tokens-of hl l)))]
+              [s p]
+              (recur (inc l) (dec limit))))))
+      :else nil)))
+
+(defn show-match!
+  "Show the matching bracket of the one at the caret, and stop showing the one before."
+  [hl]
+  (let [v (:view hl)
+        b (:buffer v)
+        old (:match @(:extra hl))
+        new (when (ui/selection-empty? v) (matching-bracket hl (:cursor v)))]
+    (when (not= old new)
+      (swap! (:extra hl) assoc :match new)
+      (doseq [p (distinct (concat old new))]
+        (when (<= p (ui/buffer-length b))
+          (let [l (ui/position-line b p)] (relex! hl l l)))))))
+
+(defn highlighter
+  "Color the code view v's text as the language lang lexes it, and keep it colored as it
+changes. match-color is a function giving the matching bracket's background. Returns the
+highlighter."
+  [v lang match-color]
+  (let [b (:buffer v)
+        n (ui/buffer-line-count b)
+        hl {:view v :lang lang :match-color match-color
+            :states (atom (into [(:initial-state lang)] (repeat n nil)))
+            :extra (atom {:match nil})}]
+    ;; Color it all, one line after another.
+    (let [runs (loop [l 0 state (:initial-state lang) runs (transient [])]
+                 (if (< l n)
+                   (let [[rs end] (line-runs hl l state)]
+                     (swap! (:states hl) assoc (inc l) end)
+                     (recur (inc l) end (reduce conj! runs rs)))
+                   (persistent! runs)))]
+      (ui/set-text-runs! v runs))
+    (ui/on b :changed
+           (fn [e]
+             (let [line (ui/position-line b (:start e))
+                   removed (newlines (:removed-text e))
+                   added (newlines (:inserted-text e))]
+               (when (not= removed added)
+                 (swap! (:states hl)
+                        (fn [st] (into (into (subvec st 0 (inc line)) (repeat added nil))
+                                       (subvec st (min (count st) (+ line 1 removed)))))))
+               (relex! hl line (+ line added))
+               ;; The brackets shown as matching moved with the text: show them plain.
+               (let [delta (- (:new-end e) (:old-end e))
+                     old (keep (fn [p] (cond (< p (:start e)) p
+                                             (>= p (:old-end e)) (+ p delta)
+                                             :else nil))
+                               (:match @(:extra hl)))]
+                 (swap! (:extra hl) assoc :match nil)
+                 (doseq [p old]
+                   (when (< p (ui/buffer-length b))
+                     (let [l (ui/position-line b p)] (relex! hl l l))))))))
+    (ui/on v :selection-changed (fn [_] (show-match! hl)))
+    hl))

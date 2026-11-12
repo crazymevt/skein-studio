@@ -1,0 +1,118 @@
+(ns skein.studio.editor-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.string :as string]
+            [skein.studio.lang :as lang]
+            [skein.studio.lang.skein :as sk]
+            [skein.studio.editor :as editor]
+            [skein.studio.highlight :as highlight]))
+
+;; The Skein editor (Skein's M3.7 step 2, D-109) on the headless backend: coloring, kept
+;; up to date a line or two at a time; the matching bracket; indentation; comments; pairs.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(def skein (lang/language-for "x.skn"))
+
+(defn- view [text]
+  (let [b (ui/make-text-buffer {:text text})
+        v (editor/make-view b skein {})]
+    (set-slot! v :highlighter (highlight/highlighter v skein (fn [] "#ff0000")))
+    v))
+
+(defn- style-at [v p]
+  (some (fn [[s e a]] (when (and (<= s p) (< p e)) (:style a))) (ui/text-runs v)))
+
+(deftest coloring
+  (let [v (view "(defn f [x]\n  \"a\nb\" ; note\n  :k 42 #_x)")
+        text (ui/code-text v)
+        at (fn [s] (string/index-of text s))]
+    (are [s style] (= style (style-at v (at s)))
+      "defn" :definer
+      "(defn" :depth-0
+      "[x]" :depth-1
+      "\"a" :string
+      "b\"" :string
+      "; note" :comment
+      ":k" :keyword
+      "42" :number
+      "#_" :reader)
+    (is (nil? (style-at v (at "f ["))) "a symbol isn't colored")))
+
+(deftest coloring-kept-up-to-date-against-coloring-afresh
+  ;; Random edits, among them quotes and brackets that change how far the colors reach;
+  ;; after each, the runs are those of coloring the whole text again.
+  (let [pieces ["(" ")" "[" "]" "\"" "\n" " " "x" ";" "#|" "|#" ":a" "1" "\\" "#\"" "{"]
+        v (view "(ns a)\n\n(defn f [x]\n  (str \"s\" x)) ; done\n")]
+    (dotimes [_ 150]
+      (let [b (:buffer v)
+            n (ui/buffer-length b)
+            s (rand-int (inc n))
+            e (min n (+ s (if (< (rand) 0.3) (rand-int 4) 0)))]
+        (ui/replace-buffer-range! b s e (apply str (repeatedly (rand-int 3)
+                                                               (fn [] (rand-nth pieces)))))
+        (is (= (ui/text-runs (view (ui/code-text v))) (ui/text-runs v)))))))
+
+(deftest the-matching-bracket
+  (let [v (view "(defn f [x]\n  (inc x))")
+        text (ui/code-text v)
+        last-paren (dec (count text))
+        background (fn [p] (some (fn [[s e a]] (when (and (<= s p) (< p e)) (:background a)))
+                                 (ui/text-runs v)))]
+    (ui/set-cursor! v (count text))
+    (is (= [last-paren 0] (highlight/matching-bracket (:highlighter v) (count text))))
+    (is (= "#ff0000" (background 0)))
+    (is (= "#ff0000" (background last-paren)))
+    (ui/set-cursor! v (string/index-of text "[x]"))
+    (is (= [(string/index-of text "[x]") (string/index-of text "]")]
+           (highlight/matching-bracket (:highlighter v) (:cursor v))))
+    (is (nil? (background 0)) "the old match goes")
+    (ui/set-cursor! v 3)
+    (is (nil? (highlight/matching-bracket (:highlighter v) 3)))))
+
+(deftest indentation
+  (are [before col] (= col (sk/indent-at (string/split-lines before)))
+    "(defn f [x]" 2
+    "(foo a" 5
+    "(foo" 1
+    "[1 2" 1
+    "{:a 1" 1
+    "(let [a 1" 6
+    "(let [a 1]" 2
+    "(when-let [x (f)]" 2
+    "(def x\n  (foo bar\n       baz" 7
+    "(defn f []\n  (if x\n    y" 4
+    "#(foo %" 6
+    "(ns a)" 0
+    "(foo \"a (b\"" 5
+    ";; (not this\n(bar" 1))
+
+(deftest editing-keys
+  (let [v (view "(defn f [x]")]
+    (testing "Return starts the line where it belongs"
+      (ui/set-cursor! v (count (ui/code-text v)))
+      (headless/press-key! v "Return")
+      (is (= "(defn f [x]\n  " (ui/code-text v)))
+      (is (= (count (ui/code-text v)) (:cursor v))))
+    (testing "pairs"
+      (ui/emit! v (ui/event-for v :text-input :text "("))
+      (is (= "(defn f [x]\n  ()" (ui/code-text v)))
+      (ui/emit! v (ui/event-for v :text-input :text ")"))
+      (is (= "(defn f [x]\n  ()" (ui/code-text v)) "a closer types over")
+      (is (= (count (ui/code-text v)) (:cursor v)))
+      (ui/set-cursor! v (dec (count (ui/code-text v))))
+      (headless/press-key! v "Backspace")
+      (is (= "(defn f [x]\n  " (ui/code-text v)) "Backspace takes an empty pair"))
+    (testing "Tab indents again"
+      (ui/set-buffer-text! (:buffer v) "(defn f [x]\nx)")
+      (ui/set-cursor! v (count (ui/code-text v)))
+      (headless/press-key! v "Tab")
+      (is (= "(defn f [x]\n  x)" (ui/code-text v))))
+    (testing "comments, out and back in"
+      (ui/select-all! v)
+      (headless/press-key! v "Primary+/")
+      (is (= ";; (defn f [x]\n;;   x)" (ui/code-text v)))
+      (ui/select-all! v)
+      (headless/press-key! v "Primary+/")
+      (is (= "(defn f [x]\n  x)" (ui/code-text v))))))

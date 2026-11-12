@@ -1,0 +1,148 @@
+(ns skein.studio.editor
+  "The editor's view (Skein's D-109): a code view that knows its language. Return starts
+the new line where the language indents it, Tab indents the line (or the selected lines)
+again, Primary+/ comments the lines out or back in, and the language's pairs type both
+characters, typing over a closer that is already there and deleting both with Backspace
+when nothing is between them."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [skein.studio.lang :as lang]))
+
+(defclass editor-view [ui/code-view-widget]
+  "A code view of a document in a language (:lang, a registered language's map)."
+  (lang :init nil)
+  (highlighter :cell :atom :init nil))
+
+(defn make-view
+  "An editor view of the text buffer b in the language l. opts are the code view's."
+  [b l opts]
+  (ui/build editor-view (merge opts {:buffer b :lang l}) nil))
+
+;;; Lines
+
+(defn- leading-spaces [text]
+  (count (take-while (fn [c] (= c \space)) text)))
+
+(defn- selected-lines
+  "[first last], the lines the view's selection touches (a selection ending at a line's
+start doesn't take that line)."
+  [v]
+  (let [b (:buffer v)
+        [s e] (ui/selection v)
+        last-pos (if (and (> e s) (= e (ui/line-start b (ui/position-line b e)))) (dec e) e)]
+    [(ui/position-line b s) (ui/position-line b last-pos)]))
+
+(defn indent-lines!
+  "Indent lines first to last as the view's language says. Returns the view."
+  [v first-line last-line]
+  (when-let [indent (:indent (:lang v))]
+    (let [b (:buffer v)]
+      (ui/with-undo-group [b]
+        (doseq [l (range first-line (inc last-line))]
+          (let [text (ui/line-text b l)
+                have (leading-spaces text)
+                want (if (string/blank? text) 0 (indent b l))
+                start (ui/line-start b l)]
+            (when (not= have want)
+              (ui/replace-buffer-range! b start (+ start have) (apply str (repeat want " ")))))))))
+  v)
+
+(defn newline-and-indent!
+  "Replace the selection with a new line, started where the language indents it."
+  [v]
+  (ui/replace-selection! v "\n")
+  (let [b (:buffer v)
+        l (ui/position-line b (:cursor v))]
+    (if-let [indent (:indent (:lang v))]
+      (let [want (indent b l)
+            start (ui/line-start b l)
+            have (leading-spaces (ui/line-text b l))]
+        (ui/replace-buffer-range! b start (+ start have) (apply str (repeat want " ")))
+        (ui/set-cursor! v (+ start want)))
+      v)))
+
+(defn toggle-comment!
+  "Comment the selected lines out with the language's line comment, or back in if each
+that isn't blank already is."
+  [v]
+  (when-let [c (:line-comment (:lang v))]
+    (let [b (:buffer v)
+          [f l] (selected-lines v)
+          lines (filterv (fn [i] (not (string/blank? (ui/line-text b i)))) (range f (inc l)))
+          trimmed (string/trim c)
+          commented? (fn [i] (string/starts-with? (string/trim (ui/line-text b i)) trimmed))
+          column (reduce min 1000000 (map (fn [i] (leading-spaces (ui/line-text b i))) lines))]
+      (when (seq lines)
+        (ui/with-undo-group [b]
+          (if (every? commented? lines)
+            (doseq [i lines]
+              (let [text (ui/line-text b i)
+                    at (+ (ui/line-start b i) (leading-spaces text))
+                    n (if (string/starts-with? (subs text (leading-spaces text)) c)
+                        (count c)
+                        (count trimmed))]
+                (ui/delete-buffer-range! b at (+ at n))))
+            (doseq [i lines]
+              (ui/insert-into-buffer! b (+ (ui/line-start b i) column) c)))))))
+  v)
+
+;;; Pairs
+
+(defn- char-at [v p]
+  (let [b (:buffer v)]
+    (when (< -1 p (ui/buffer-length b)) (ui/buffer-char b p))))
+
+(defn type-pair!
+  "Type s (one character) in the view as its language's pairs say: an opener inserts its
+closer too when what follows ends a word; a closer already there is typed over. True if it
+handled s; false to type it as usual."
+  [v s]
+  (let [pairs (:pairs (:lang v))
+        c (first s)
+        next-c (char-at v (:cursor v))
+        closers (set (vals pairs))]
+    (cond
+      (not= 1 (count s)) false
+      ;; Typing over the closer: the caret moves past it.
+      (and (contains? closers c) (= c next-c) (ui/selection-empty? v))
+      (do (ui/set-cursor! v (inc (:cursor v))) true)
+      (and (contains? pairs c) (ui/selection-empty? v)
+           (or (nil? next-c) (contains? #{\space \tab \newline} next-c) (contains? closers next-c)))
+      (let [p (:cursor v)]
+        (ui/replace-selection! v (str c (get pairs c)))
+        (ui/set-cursor! v (inc p))
+        true)
+      :else false)))
+
+(defn delete-pair!
+  "Backspace between an empty pair deletes both. True if it did."
+  [v]
+  (let [p (:cursor v)
+        before (char-at v (dec p))
+        after (char-at v p)]
+    (if (and (ui/selection-empty? v) before (= after (get (:pairs (:lang v)) before)))
+      (do (ui/delete-buffer-range! (:buffer v) (dec p) (inc p)) true)
+      false)))
+
+;;; Keys
+
+(defmethod ui/handle-event [(v editor-view) (e ui/key-event)]
+  (when (and (= :key-down (:signal e)) (not (ui/consumed? e)))
+    (let [mods (set (:modifiers e))
+          primary (contains? mods (ui/primary-modifier))]
+      (cond
+        (and (= :return (:key e)) (empty? mods))
+        (do (newline-and-indent! v) (ui/consume! e))
+        (and (= :tab (:key e)) (empty? mods) (:indent (:lang v)))
+        (let [[f l] (selected-lines v)] (indent-lines! v f l) (ui/consume! e))
+        (and (= \/ (:key e)) primary)
+        (do (toggle-comment! v) (ui/consume! e))
+        (and (= :backspace (:key e)) (empty? mods) (delete-pair! v))
+        (ui/consume! e)
+        :else nil)))
+  (call-next-method))
+
+(defmethod ui/handle-event [(v editor-view) (e ui/text-input-event)]
+  (when (and (not (ui/consumed? e)) (:editable v) (type-pair! v (:text e)))
+    (ui/consume! e))
+  (call-next-method))

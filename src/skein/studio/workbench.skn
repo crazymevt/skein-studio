@@ -15,7 +15,11 @@ commands here are what its menus do, and what tests call.
             [skein.studio.settings :as settings]
             [skein.studio.themes :as themes]
             [skein.studio.documents :as docs]
-            [skein.studio.explorer :as explorer]))
+            [skein.studio.explorer :as explorer]
+            [skein.studio.lang :as lang]
+            [skein.studio.lang.skein]
+            [skein.studio.editor :as editor]
+            [skein.studio.highlight :as highlight]))
 
 ;;; State
 
@@ -129,10 +133,14 @@ editor."
   (if-let [ed (editor-for wb path)]
     (do (ui/select-page! (:tabs wb) (:view ed)) ed)
     (let [d (docs/open-document path)
-          v (ui/code-view {:buffer (:buffer d) :tab-label (docs/document-name d)
-                           :tab-tooltip path})
+          l (lang/language-for path)
+          v (editor/make-view (:buffer d) l {:tab-label (docs/document-name d)
+                                            :tab-tooltip path})
           ed {:document d :view v}]
       (style-view! v)
+      (when (seq (:extensions l))
+        (set-slot! v :highlighter
+                   (highlight/highlighter v l (fn [] (themes/color (current-theme) :match)))))
       (swap! (:state wb) assoc-in [:editors v] ed)
       (ui/on (:buffer d) :changed (fn [_] (refresh-editor! wb ed)))
       (ui/on v :selection-changed (fn [_] (refresh-position! wb)))

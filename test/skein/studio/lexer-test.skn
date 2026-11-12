@@ -1,0 +1,131 @@
+(ns skein.studio.lexer-test
+  (:require [skein.test :refer [deftest is are testing]]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.compiler.reader :as reader]
+            [skein.studio.lang :as lang]
+            [skein.studio.lang.skein :as sk]))
+
+;; Skein's lexer (Skein's M3.7 step 2, D-109), by hand and against Skein's reader.
+
+(defn- kinds
+  "The tokens of text, lexed from the initial state, as [text kind]."
+  [text]
+  (let [[tokens _] (sk/lex-line text sk/initial-state)]
+    (mapv (fn [[s e kind]] [(subs text s e) kind]) tokens)))
+
+(deftest tokens
+  (is (= [["(" :open] ["defn" :head] ["f" :symbol] ["[" :open] ["x" :symbol] ["]" :close]
+          ["x" :symbol] [")" :close]]
+         (kinds "(defn f [x] x)")))
+  (is (= [["\"a \\\"q\\\" b\"" :string] [";; note" :comment]] (kinds "\"a \\\"q\\\" b\" ;; note")))
+  (is (= [["\\a" :character] ["\\newline" :character] ["\\(" :character] ["\\;" :character]]
+         (kinds "\\a \\newline \\( \\;")))
+  (is (= [["42" :number] ["-7" :number] ["0xFF" :number] ["1.5f" :number] ["-" :symbol]
+          ["+x" :symbol]]
+         (kinds "42 -7 0xFF 1.5f - +x")))
+  (is (= [[":a" :keyword] ["::b" :keyword] [":c/d" :keyword] ["nil" :constant]
+          ["true" :constant] ["##Inf" :constant]]
+         (kinds ":a ::b :c/d nil true ##Inf")))
+  (is (= [["#\"a\\\"b\"" :regex] ["#{" :open] ["}" :close] ["#(" :open] ["inc" :head]
+          ["%" :symbol] [")" :close]]
+         (kinds "#\"a\\\"b\" #{} #(inc %)")))
+  (is (= [["'" :reader] ["x" :symbol] ["`" :reader] ["~@" :reader] ["@" :reader] ["a" :symbol]
+          ["^" :reader] [":k" :keyword] ["#_" :reader] ["#inst" :reader]]
+         (kinds "'x ` ~@ @a ^:k #_ #inst")))
+  (testing "brackets carry their depth"
+    (is (= [[0 1 :open 0] [1 2 :open 1] [2 3 :close 1] [3 4 :close 0]]
+           (first (sk/lex-line "([])" sk/initial-state)))))
+  (testing "states across lines"
+    (let [[t1 s1] (sk/lex-line "(def s \"one" sk/initial-state)
+          [t2 s2] (sk/lex-line "two\" #| a" s1)
+          [t3 s3] (sk/lex-line "#| b |# c |# x)" s2)]
+      (is (= [:string 1] s1))
+      (is (= [[0 4 :string] [5 9 :comment]] t2))
+      (is (= [[:comment 1] 1] s2))
+      (is (= [[0 12 :comment] [13 14 :symbol] [14 15 :close 0]] t3))
+      (is (= [:code 0] s3))))
+  (testing "unfinished text"
+    (is (= [:regex 0] (second (sk/lex-line "#\"abc" sk/initial-state))))
+    (is (= [:code 2] (second (sk/lex-line "((" sk/initial-state))))
+    (is (= [:code 0] (second (sk/lex-line ")))" sk/initial-state))) "too many closers")))
+
+(deftest the-registry
+  (is (= :skein (:id (lang/language-for "src/app/main.skn"))))
+  (is (= :plain (:id (lang/language-for "README.md")))))
+
+;;; Against the reader: every form Skein's reader reads from Skein's own sources and
+;;; skein-ui's starts where the lexer has a token of its kind, and ends where it does; a
+;;; collection starts at an opening bracket and ends at a closing one.
+
+(defn- lex-file
+  "{[line column] [kind end-line end-column]} of the text's tokens, 1-based as the
+reader's locations are (the end just past the token)."
+  [text]
+  (loop [lines (string/split text #"\n" -1) l 1 state sk/initial-state out (transient {})]
+    (if-let [line (first lines)]
+      (let [[tokens end] (sk/lex-line line state)
+            out (reduce (fn [o [s e kind]] (assoc! o [l (inc s)] [kind l (inc e)])) out tokens)]
+        (recur (rest lines) (inc l) end out))
+      (persistent! out))))
+
+(defn- expected-kinds [datum]
+  (cond (string? datum) #{:string}
+        (char? datum) #{:character}
+        (number? datum) #{:number :constant}       ; ##Inf and ##NaN are constants
+        (keyword? datum) #{:keyword}
+        (or (nil? datum) (true? datum) (false? datum)) #{:constant}
+        (symbol? datum) #{:symbol :head}
+        :else #{}))
+
+(defn- check-file
+  "The disagreements between the reader and the lexer about path, as strings."
+  [path]
+  (let [text (io/read-file path)
+        tokens (lex-file text)
+        forms (reader/read-string-forms text {:file path :namespace "user"
+                                              :resolve-alias (fn [a] a)})
+        problems (transient [])
+        problem! (fn [loc what] (conj! problems (str path ":" (:line loc) ":" (:column loc)
+                                                     " " what)))
+        visit (fn visit [syn]
+                (let [loc (:loc syn)
+                      at (get tokens [(:line loc) (:column loc)])]
+                  ;; Metadata written as a map is checked; ^:k and ^Tag make one up.
+                  (when-let [m (:meta syn)]
+                    (when (= :open (first (get tokens [(:line (:loc m)) (:column (:loc m))])))
+                      (visit m)))
+                  (case (:kind syn)
+                    :atom
+                    (let [kinds (expected-kinds (:datum syn))]
+                      (cond
+                        ;; A form the reader makes up for ' ` #( #"..." and the like sits on
+                        ;; the lexer's token for it.
+                        (contains? #{:reader :open :regex} (first at)) nil
+                        (nil? at) (problem! loc (str "no token for " (pr-str (:datum syn))))
+                        (not (contains? kinds (first at)))
+                        (problem! loc (str (first at) " for " (pr-str (:datum syn))))
+                        (and (= (:line loc) (:end-line loc))
+                             (not= [(:end-line loc) (:end-column loc)] (rest at)))
+                        (problem! loc (str "a token ending elsewhere than "
+                                           (pr-str (:datum syn))))))
+                    (:list :vector :map :set)
+                    (do (when-not (contains? #{:open :reader :regex} (first at))
+                          (problem! loc (str (:kind syn) " not at an opening bracket")))
+                        ;; Made up for @( '( #"..." and the like.
+                        (when-not (or (contains? #{:reader :regex} (first at))
+                                      (= :close (first (get tokens [(:end-line loc)
+                                                                    (dec (:end-column loc))]))))
+                          (problem! loc (str (:kind syn) " not ending at a closing bracket")))
+                        (doseq [x (:datum syn)] (visit x)))
+                    (doseq [x (:datum syn)] (when (map? x) (visit x))))))]
+    (doseq [f forms] (visit f))
+    (persistent! problems)))
+
+(deftest the-lexer-agrees-with-the-reader
+  (let [files (vec (filter (fn [p] (= "skn" (io/extension p)))
+                           (concat (io/walk "../skein/lib" {:dirs false})
+                                   (io/walk "../skein-ui/src" {:dirs false}))))
+        problems (vec (mapcat check-file files))]
+    (is (< 30 (count files)) "Skein's and skein-ui's sources")
+    (is (empty? problems) (string/join "\n" (take 20 problems)))))

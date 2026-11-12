@@ -1,0 +1,240 @@
+(ns skein.studio.lang.skein
+  "Skein, the language (Skein's D-109): a line lexer that follows Skein's reader
+(skein.compiler.reader, DESIGN §3), tolerant of unfinished text; the styles of its tokens;
+and indentation by Skein's forms.
+
+A line starts in a state [mode depth]: mode is :code, :string or :regex (inside one that
+goes on past the line) or [:comment n] (inside n nested #| |# comments), and depth is how
+many brackets are open. Tokens are [start end kind], kind one of :comment, :string,
+:regex, :character, :number, :keyword, :constant (nil, true, false), :symbol, :head (a
+symbol right after an opening parenthesis), :reader (' ` ~ ~@ @ ^ #_ ## and #tag) and
+:error; brackets are [start end :open depth] and [start end :close depth], depth counting
+from 0 for the outermost."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [skein.studio.lang :as lang]))
+
+;;; Characters, as the reader classes them
+
+(defn- whitespace? [c]
+  (and c (or (= c \space) (= c \tab) (= c \newline) (= c \return) (= c \formfeed)
+             (= c \,) (= (int c) 11))))
+
+(def ^:private terminating (set "\";@^`~()[]{}\\"))
+
+(defn- token-end? [c] (or (nil? c) (whitespace? c) (contains? terminating c)))
+
+(defn- digit? [c] (and c (<= 48 (int c) 57)))
+
+(defn- number-start? [text i n]
+  (let [c (nth text i)]
+    (or (digit? c)
+        (and (or (= c \+) (= c \-)) (< (inc i) n) (digit? (nth text (inc i)))))))
+
+;;; The lexer
+
+(defn- string-end
+  "Where the string (or regex) from i ends, just past its closing quote, or nil if it goes
+on past the line. A backslash takes the next character with it."
+  [text i n]
+  (loop [i i]
+    (cond (>= i n) nil
+          (= (nth text i) \\) (recur (+ i 2))
+          (= (nth text i) \") (inc i)
+          :else (recur (inc i)))))
+
+(defn- comment-end
+  "[end depth]: where the #| |# comment, depth deep at i, ends on the line (depth 0), or
+the line's end and the depth still open."
+  [text i n depth]
+  (loop [i i depth depth]
+    (cond (>= i n) [n depth]
+          (and (= (nth text i) \|) (< (inc i) n) (= (nth text (inc i)) \#))
+          (if (= depth 1) [(+ i 2) 0] (recur (+ i 2) (dec depth)))
+          (and (= (nth text i) \#) (< (inc i) n) (= (nth text (inc i)) \|))
+          (recur (+ i 2) (inc depth))
+          :else (recur (inc i) depth))))
+
+(defn- token-end
+  "Where the token from i ends: the next character that ends a token."
+  [text i n]
+  (loop [j i] (if (and (< j n) (not (token-end? (nth text j)))) (recur (inc j)) j)))
+
+(def initial-state [:code 0])
+
+(defn lex-line
+  "[tokens end-state] of a line of Skein, lexed from state ([mode depth])."
+  [text [mode depth]]
+  (let [n (count text)]
+    (loop [i 0 mode mode depth depth after-paren false out (transient [])]
+      (cond
+        (= mode :string)
+        (if-let [e (string-end text i n)]
+          (recur e :code depth false (conj! out [i e :string]))
+          [(persistent! (if (< i n) (conj! out [i n :string]) out)) [:string depth]])
+
+        (= mode :regex)
+        (if-let [e (string-end text i n)]
+          (recur e :code depth false (conj! out [i e :regex]))
+          [(persistent! (if (< i n) (conj! out [i n :regex]) out)) [:regex depth]])
+
+        (vector? mode)
+        (let [[e d] (comment-end text i n (second mode))
+              out (if (< i e) (conj! out [i e :comment]) out)]
+          (if (zero? d)
+            (recur e :code depth after-paren out)
+            [(persistent! out) [[:comment d] depth]]))
+
+        (>= i n) [(persistent! out) [:code depth]]
+
+        :else
+        (let [c (nth text i)
+              d (when (< (inc i) n) (nth text (inc i)))]
+          (cond
+            (whitespace? c) (recur (inc i) :code depth after-paren out)
+            (= c \;) [(persistent! (conj! out [i n :comment])) [:code depth]]
+            (= c \") (if-let [e (string-end text (inc i) n)]
+                       (recur e :code depth false (conj! out [i e :string]))
+                       [(persistent! (conj! out [i n :string])) [:string depth]])
+            (contains? #{\( \[ \{} c)
+            (recur (inc i) :code (inc depth) (= c \() (conj! out [i (inc i) :open depth]))
+            (contains? #{\) \] \}} c)
+            (let [d (max 0 (dec depth))]
+              (recur (inc i) :code d false (conj! out [i (inc i) :close d])))
+            (= c \\) (let [e (if (< (inc i) n) (token-end text (+ i 2) n) n)]
+                       (recur e :code depth false (conj! out [i e :character])))
+            (= c \#)
+            (cond (= d \{) (recur (+ i 2) :code (inc depth) false
+                                  (conj! out [i (+ i 2) :open depth]))
+                  (= d \() (recur (+ i 2) :code (inc depth) true
+                                  (conj! out [i (+ i 2) :open depth]))
+                  (= d \") (if-let [e (string-end text (+ i 2) n)]
+                             (recur e :code depth false (conj! out [i e :regex]))
+                             [(persistent! (conj! out [i n :regex])) [:regex depth]])
+                  (= d \|) (let [[e cd] (comment-end text (+ i 2) n 1)
+                                 out (conj! out [i e :comment])]
+                             (if (zero? cd)
+                               (recur e :code depth after-paren out)
+                               [(persistent! out) [[:comment cd] depth]]))
+                  (= d \_) (recur (+ i 2) :code depth false (conj! out [i (+ i 2) :reader]))
+                  (= d \#) (let [e (token-end text (+ i 2) n)]
+                             (recur e :code depth false (conj! out [i e :constant])))
+                  (or (nil? d) (token-end? d)) (recur (inc i) :code depth false
+                                                      (conj! out [i (inc i) :error]))
+                  :else (let [e (token-end text (inc i) n)]
+                          (recur e :code depth false (conj! out [i e :reader]))))
+            (and (= c \~) (= d \@)) (recur (+ i 2) :code depth false
+                                           (conj! out [i (+ i 2) :reader]))
+            (contains? #{\' \` \~ \@ \^} c) (recur (inc i) :code depth false
+                                                   (conj! out [i (inc i) :reader]))
+            :else
+            (let [e (token-end text i n)
+                  word (subs text i e)
+                  kind (cond (number-start? text i n) :number
+                             (= c \:) :keyword
+                             (contains? #{"nil" "true" "false"} word) :constant
+                             after-paren :head
+                             :else :symbol)]
+              (recur e :code depth false (conj! out [i e kind])))))))))
+
+;;; Styles
+
+(def definers
+  "The heads whose forms define something: their names are colored as definers."
+  #{"ns" "def" "defn" "defn-" "defmacro" "defonce" "defclass" "defgeneric" "defmethod"
+    "defcondition" "defrecord" "defstruct" "defprotocol" "deftype" "deftest" "defsoa"})
+
+(def specials
+  "Special forms and the core's usual macros, colored as such."
+  #{"if" "do" "let" "fn" "loop" "recur" "quote" "var" "throw" "try" "catch" "finally"
+    "set!" "when" "when-not" "when-let" "if-let" "if-not" "cond" "condp" "case" "and" "or"
+    "letfn" "binding" "doseq" "dotimes" "for" "while" "->" "->>" "as->" "cond->" "some->"
+    "with-open" "future" "nursery" "go" "alts!" "error" "handler-case" "restart-case"})
+
+(defn token-style
+  "The text style of a token of text."
+  [[s e kind depth] text]
+  (case kind
+    (:open :close) (keyword (str "depth-" (mod depth 6)))
+    :head (let [w (subs text s e)]
+            (cond (or (contains? definers w) (string/starts-with? w "def")) :definer
+                  (contains? specials w) :special
+                  :else nil))
+    :symbol nil
+    kind))
+
+;;; Indentation by Skein's forms: a line inside brackets starts one past a [ or {; inside
+;;; ( it starts two past it for a form with a body, under the first argument if one is on
+;;; the head's line, else one past the bracket.
+
+(def body-forms
+  "Heads whose forms have bodies, indented two past their bracket."
+  (into #{"fn" "let" "loop" "do" "when" "when-not" "when-let" "if-let" "if" "if-not"
+          "binding" "doseq" "dotimes" "for" "while" "letfn" "try" "catch" "finally" "cond"
+          "condp" "case" "with-open" "future" "nursery" "testing" "handler-case"
+          "restart-case"}
+        definers))
+
+(defn- body-form? [head]
+  (or (contains? body-forms head)
+      (string/starts-with? head "def")
+      (string/starts-with? head "with-")))
+
+(defn indent-at
+  "The column the text after lines (a vector of strings, the lines before it, starting at
+the top) should start at."
+  [lines]
+  (let [step (fn [{:keys [state stack]} [l line]]
+               (let [[tokens end] (lex-line line state)
+                     stack (reduce
+                            (fn [stack [s e kind]]
+                              (case kind
+                                ;; #( and #{ count as ( and {.
+                                :open (conj stack {:col s :line l :head nil :arg nil
+                                                   :kind (let [c (nth line s)]
+                                                           (if (= c \#) (nth line (inc s)) c))})
+                                :close (if (seq stack) (pop stack) stack)
+                                :comment stack
+                                ;; The first token in a ( is its head; the next on the head's
+                                ;; line its first argument.
+                                (if (empty? stack)
+                                  stack
+                                  (let [top (peek stack)]
+                                    (cond (and (= (:kind top) \() (nil? (:head top))
+                                               (= l (:line top)))
+                                          (conj (pop stack) (assoc top :head (subs line s e)))
+                                          (and (:head top) (nil? (:arg top)) (= l (:line top)))
+                                          (conj (pop stack) (assoc top :arg s))
+                                          :else stack)))))
+                            stack tokens)]
+                 {:state end :stack stack}))
+        top (peek (:stack (reduce step {:state initial-state :stack []}
+                                  (map-indexed vector lines))))]
+    (cond (nil? top) 0
+          (not= (:kind top) \() (inc (:col top))
+          (and (:head top) (body-form? (:head top))) (+ 2 (:col top))
+          (:arg top) (:arg top)
+          :else (inc (:col top)))))
+
+(defn indent-line
+  "The column line of the text buffer b should start at."
+  [b line]
+  ;; From the last line above that starts at the top level: one with no indentation.
+  (let [get-line (fn [l] (ui/line-text b l))
+        start (loop [l (dec line)]
+                (cond (<= l 0) 0
+                      (let [t (get-line l)]
+                        (and (pos? (count t)) (contains? #{\( \[ \{} (nth t 0))))
+                      l
+                      :else (recur (dec l))))]
+    (indent-at (mapv get-line (range start line)))))
+
+(def language
+  "Skein."
+  (lang/define-language!
+   {:id :skein :name "Skein" :extensions #{"skn"}
+    :lex lex-line :initial-state initial-state
+    :style token-style
+    :indent indent-line
+    :line-comment ";; "
+    :pairs {\( \) \[ \] \{ \} \" \"}}))
