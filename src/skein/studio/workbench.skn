@@ -28,6 +28,7 @@ commands here are what its menus do, and what tests call.
             [skein.studio.problems :as problems]
             [skein.studio.palette :as palette]
             [skein.studio.search :as search]
+            [skein.process :as process]
             [skein.swank.client :as swank]))
 
 ;;; State
@@ -407,13 +408,25 @@ Returns true if it closed."
     :debug-return (debugger/debug-return! (:debugger wb) e)
     nil))
 
-(defn stop-program!
-  "Stop talking to the program, and stop it if the workbench started it."
+(defn- stop-running!
+  "Stop-program!'s work, which a start does first: what was typed at the REPL for the
+start stays."
   [wb]
-  (when-let [inf (inferior wb)]
-    (swap! (:state wb) dissoc :inferior)
-    (inferior/stop! inf)
-    (message! wb "Stopped")))
+  (let [[old _] (swap-vals! (:state wb) dissoc :inferior :starting)]
+    (when-let [inf (:inferior old)]
+      (inferior/stop! inf))
+    ;; skein dev, if it has started, before its Swank answers
+    (when-let [p (some-> (:starting old) deref)]
+      (when (process/alive? p) (process/destroy-tree! p)))
+    (when (or (:inferior old) (:starting old))
+      (message! wb "Stopped"))))
+
+(defn stop-program!
+  "Stop talking to the program, and stop it if the workbench started it, also while it's
+still starting."
+  [wb]
+  (swap! (:state wb) dissoc :repl-pending)
+  (stop-running! wb))
 
 (defn- running! [wb inf what]
   (swap! (:state wb) assoc :inferior inf)
@@ -428,18 +441,31 @@ Returns true if it closed."
   "Stop the program running, if one is, and run main under skein dev in folder, connecting
 to it; label names it in the status bar."
   [wb folder main label]
-  (stop-program! wb)
-  (swap! (:state wb) assoc :starting true)
-  (message! wb (str "Starting " label " under skein dev…"))
-  (async! wb (fn [] (inferior/start! folder main
-                                     (fn [line] (on-ui wb append-output! (str line "\n")))
-                                     (fn [e] (on-ui wb handle-swank-event! e))))
-          (fn [r]
-            (swap! (:state wb) dissoc :starting)
-            (if-let [inf (:value r)]
-              (running! wb inf (str "Running " label))
-              (do (swap! (:state wb) dissoc :repl-pending)
-                  (message! wb (str "Couldn't run " label ": " (reason (:error r)))))))))
+  (stop-running! wb)
+  ;; This start, until it's running: it holds skein dev's process once that has started,
+  ;; for Stop Program, which forgets the start.
+  (let [starting (atom nil)
+        current? (fn [] (identical? starting (:starting @(:state wb))))]
+    (swap! (:state wb) assoc :starting starting)
+    (message! wb (str "Starting " label " under skein dev…"))
+    (async! wb (fn [] (inferior/start! folder main
+                                       (fn [line] (on-ui wb append-output! (str line "\n")))
+                                       (fn [e] (on-ui wb handle-swank-event! e))
+                                       (fn [p]
+                                         (reset! starting p)
+                                         ;; stopped already, before it had the process
+                                         (when-not (current?)
+                                           (when (process/alive? p)
+                                             (process/destroy-tree! p))))))
+            (fn [r]
+              (cond
+                ;; stopped (or started again) meanwhile: whatever it started goes too
+                (not (current?)) (when-let [inf (:value r)] (inferior/stop! inf))
+                (:value r) (do (swap! (:state wb) dissoc :starting)
+                               (running! wb (:value r) (str "Running " label)))
+                :else (do (swap! (:state wb) dissoc :starting :repl-pending)
+                          (message! wb (str "Couldn't run " label ": "
+                                            (reason (:error r))))))))))
 
 (defn run-program!
   "Run the folder's project under skein dev (its project.skn's :main), or the active

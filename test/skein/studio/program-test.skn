@@ -99,6 +99,24 @@
     (wb/stop-program! w)
     (ui/close! (:window w))))
 
+(deftest stopping-a-program-that-is-starting
+  ;; Stop Program, before the program's Swank answers, stops skein dev too: it doesn't go
+  ;; on to connect later.
+  (let [w (wb/make-workbench)
+        process-of (fn [] (some-> (:starting @(:state w)) deref))]
+    (ui/show! (:window w))
+    (wb/start-repl! w)
+    (is (wait-until 30 process-of) "skein dev started")
+    (let [p (process-of)]
+      (wb/stop-program! w)
+      (is (= "Stopped" (:text (:message w))))
+      (is (wait-until 10 (fn [] (not (process/alive? p)))) "skein dev was stopped")
+      (wait-until 3 (fn [] false))
+      (is (not (wb/connected? w)))
+      (is (nil? (:starting @(:state w))))
+      (is (= "Stopped" (:text (:message w))) "not that it couldn't run"))
+    (ui/close! (:window w))))
+
 (deftest forms-and-heads
   (let [text "(ns a)\n\n(defn f [x]\n  (+ x\n     (inc x)))\n\n;; end\n"
         b (ui/make-text-buffer {:text text})

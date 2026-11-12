@@ -41,30 +41,34 @@ src/game/player.skn."
 (defn start!
   "Run the file main under skein dev, in folder, with Swank on a free port, and connect
 to it. on-output is called with each line skein dev and the program print, on-event with
-each of Swank's events. Returns the inferior, or signals an error saying why not."
-  [folder main on-output on-event]
-  (let [home (skein-home)
-        p (process/process [(io/path home "build/skeinc") "dev" "--no-server" "--swank-port" "0"
-                            main]
-                           {:dir folder :extra-env {"SKEIN_HOME" home} :err :out})
-        lines (io/line-seq (:out p))
-        ;; Its first lines, up to the one that names Swank's port.
-        port (loop [ls lines]
-               (if-let [line (first ls)]
-                 (if-let [port (swank-port line)]
-                   (do (future (doseq [l (rest ls)] (on-output l))) port)
-                   (do (on-output line) (recur (rest ls))))
-                 nil))]
-    (when-not port
-      (process/destroy-tree! p)
-      (error (str "skein dev didn't start Swank for " main)))
-    (let [conn (swank/connect "localhost" port {:timeout 120})]
-      (swank/call (swank/create-repl conn) 60)
-      (future (loop []
-                (when-let [e (<! (swank/events conn))]
-                  (on-event e)
-                  (recur))))
-      {:conn conn :process p :main main})))
+each of Swank's events, and on-process (if given) with skein dev's process as soon as it
+starts, so it can be stopped before Swank answers. Returns the inferior, or signals an
+error saying why not."
+  ([folder main on-output on-event] (start! folder main on-output on-event nil))
+  ([folder main on-output on-event on-process]
+   (let [home (skein-home)
+         p (process/process [(io/path home "build/skeinc") "dev" "--no-server" "--swank-port"
+                             "0" main]
+                            {:dir folder :extra-env {"SKEIN_HOME" home} :err :out})
+         _ (when on-process (on-process p))
+         lines (io/line-seq (:out p))
+         ;; Its first lines, up to the one that names Swank's port.
+         port (loop [ls lines]
+                (if-let [line (first ls)]
+                  (if-let [port (swank-port line)]
+                    (do (future (doseq [l (rest ls)] (on-output l))) port)
+                    (do (on-output line) (recur (rest ls))))
+                  nil))]
+     (when-not port
+       (when (process/alive? p) (process/destroy-tree! p))
+       (error (str "skein dev didn't start Swank for " main)))
+     (let [conn (swank/connect "localhost" port {:timeout 120})]
+       (swank/call (swank/create-repl conn) 60)
+       (future (loop []
+                 (when-let [e (<! (swank/events conn))]
+                   (on-event e)
+                   (recur))))
+       {:conn conn :process p :main main}))))
 
 (defn connect!
   "Connect to a Swank server already running on host and port. on-event is called with
