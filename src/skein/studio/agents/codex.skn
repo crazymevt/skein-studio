@@ -1,0 +1,321 @@
+(ns skein.studio.agents.codex
+  "Codex through codex app-server, JSON-RPC over stdio (Skein's M3.8, D-110), as Lisp
+Studio has it. The IDE's tools are dynamic tools (an experimental API), called back as
+item/tool/call requests; a message sent mid-turn steers it with turn/steer."
+  (:require [skein.string :as string]
+            [skein.studio.agents :as agents :refer [jget emit! state]]))
+
+(defn- cli [a] (state a :cli))
+
+(defn- send-json! [a x] (agents/send-json! (cli a) x))
+
+(defn- request!
+  "Send a request; callback, if any, gets its result and an error message."
+  ([a method params] (request! a method params nil))
+  ([a method params callback]
+   (let [id (:next-id (swap! (:state a) update :next-id (fnil inc 0)))]
+     (when callback (swap! (:state a) assoc-in [:pending id] callback))
+     (send-json! a {"id" id "method" method "params" params})
+     id)))
+
+(defn- omit-nils [m] (into {} (remove (fn [[_ v]] (nil? v)) m)))
+
+(defn thread-params
+  "thread/start's or thread/resume's parameters for the adapter's state now."
+  [a]
+  (let [{:keys [autonomy model session-id]} (state a)]
+    (omit-nils
+     {"cwd" (:folder a)
+      "model" model
+      "approvalPolicy" (if (= autonomy :ask) "untrusted" "on-request")
+      "sandbox" (if (= autonomy :read-only) "read-only" "workspace-write")
+      "developerInstructions" (when-not (string/blank? (:instructions a)) (:instructions a))
+      ;; a thread keeps the tools it was made with
+      "dynamicTools" (when-not session-id
+                       (mapv (fn [t] {"type" "function" "name" (:name t)
+                                      "description" (:description t)
+                                      "inputSchema" (:schema t)})
+                             (:tools a)))
+      "threadId" session-id})))
+
+(defn models
+  "Codex's models as the events give them."
+  [ms]
+  (vec (for [m ms
+             :when (not (get m "hidden"))]
+         {:id (or (get m "id") (get m "model"))
+          :label (or (get m "displayName") (get m "id"))
+          :description (get m "description")
+          :default (boolean (get m "isDefault"))
+          :efforts (vec (keep (fn [o] (get o "reasoningEffort"))
+                              (get m "supportedReasoningEfforts")))
+          :default-effort (get m "defaultReasoningEffort")})))
+
+;;; Writing
+
+(def ^:private on-line!)
+(def ^:private open-thread!)
+
+(defn- start [a]
+  (emit! a :status :status :starting)
+  (swap! (:state a) assoc :busy false :turn nil :pending {} :requests {} :queued [])
+  (let [c (agents/start-cli! (agents/cli-command a ["app-server"]) (:folder a)
+                             (fn [line] (on-line! a line))
+                             (fn [code err] (emit! a :exited :code code :stderr err))
+                             (fn [message] (emit! a :notice :text message)))]
+    (swap! (:state a) assoc :cli c)
+    (request! a "initialize"
+              {"clientInfo" {"name" "skein-studio" "title" "Skein Studio" "version" "0.1.0"}
+               "capabilities" {"experimentalApi" true}}
+              (fn [_ error]
+                (if error
+                  (emit! a :status :status :error :message error)
+                  (do (send-json! a {"method" "initialized"})
+                      (request! a "model/list" {"limit" 100}
+                                (fn [r error]
+                                  (when-not error
+                                    (emit! a :models :models (models (get r "data"))))))
+                      (request! a "account/rateLimits/read" {}
+                                (fn [r error]
+                                  (when-not error
+                                    (emit! a :limits
+                                           :windows (agents/codex-limit-windows r)))))
+                      (open-thread! a)))))))
+
+(defn- open-thread!
+  ;; A thread keeps the dynamic tools it was made with, and neither resuming nor forking
+  ;; changes them: one made before the IDE's tools changed is replaced by a new one.
+  [a]
+  (let [version (agents/tools-version (:tools a))
+        {:keys [session-id session-tools]} (state a)]
+    (when (and session-id (not= session-tools version))
+      (swap! (:state a) dissoc :session-id)
+      (emit! a :notice :text (str (:name a) " starts a new Codex conversation because Skein "
+                                  "Studio's tools changed."))
+      (emit! a :reset))
+    (let [resuming (state a :session-id)]
+      (request! a (if resuming "thread/resume" "thread/start") (thread-params a)
+                (fn [r error]
+                  (cond
+                    (and error resuming)        ; the thread is gone: start a new one
+                    (do (swap! (:state a) dissoc :session-id)
+                        (open-thread! a))
+                    error (emit! a :status :status :error :message error)
+                    :else
+                    (let [id (jget r "thread" "id")
+                          tools (if resuming (state a :session-tools) version)]
+                      (swap! (:state a) assoc :session-id id :session-tools tools)
+                      (emit! a :session :id id :tools tools)
+                      (emit! a :status :status :idle))))))))
+
+(defn- choose-model [a model effort]
+  ;; Codex takes both with each turn.
+  :next-turn)
+
+(defn input
+  "A turn's input: text, and the images by path."
+  [text images]
+  (into [{"type" "text" "text" text}]
+        (for [path (agents/sendable-images images)]
+          {"type" "localImage" "path" path})))
+
+(def ^:private flush-steering!)
+
+(defn- send-message [a text images]
+  (let [{:keys [session-id model effort turn-folder]} (state a)]
+    (swap! (:state a) assoc :busy true)
+    (emit! a :status :status :busy)
+    (request! a "turn/start"
+              (omit-nils {"threadId" session-id "input" (input text images)
+                          ;; always say where: a turn's folder carries over to later ones
+                          "cwd" (or turn-folder (:folder a))
+                          "model" model "effort" effort})
+              (fn [r error]
+                (if error
+                  (do (swap! (:state a) assoc :busy false)
+                      (emit! a :turn-done :error error)
+                      (emit! a :status :status :idle))
+                  (when-let [turn (jget r "turn" "id")]
+                    (swap! (:state a) assoc :turn turn)
+                    (flush-steering! a)))))))
+
+(defn- flush-steering! [a]
+  (let [[old _] (swap-vals! (:state a) (fn [s] (if (:turn s) (assoc s :queued []) s)))
+        queued (when (:turn old) (:queued old))]
+    (when (seq queued)
+      (let [text (string/join "\n\n" (map first queued))
+            images (vec (mapcat second queued))]
+        (request! a "turn/steer"
+                  {"threadId" (:session-id old) "expectedTurnId" (:turn old)
+                   "input" (input text images)}
+                  (fn [_ error]
+                    ;; the turn may have ended meanwhile: send it as a new one
+                    (when error (send-message a text images))))))))
+
+(defn- steer [a text images]
+  (if (state a :busy)
+    (do (swap! (:state a) update :queued conj [text images])
+        (flush-steering! a))
+    (send-message a text images)))
+
+(defn- interrupt [a]
+  (let [{:keys [busy turn session-id]} (state a)]
+    (when (and busy turn)
+      (request! a "turn/interrupt" {"threadId" session-id "turnId" turn}))))
+
+(defn- stop [a]
+  (agents/stop-cli! (cli a))
+  (swap! (:state a) dissoc :cli))
+
+(defn- answer [a request-id decision answers]
+  (let [open (get-in (state a) [:requests request-id])]
+    (swap! (:state a) update :requests dissoc request-id)
+    (when-let [[rpc-id method params] open]
+      (send-json!
+       a {"id" rpc-id
+          "result"
+          (case method
+            "item/tool/requestUserInput"
+            {"answers" (into {} (for [[id v] answers]
+                                  [id {"answers" (if (sequential? v) (vec v) [v])}]))}
+            "item/permissions/requestApproval"
+            {"permissions" (if (= decision :deny) {} (or (get params "permissions") {}))
+             "scope" "turn"}
+            ("execCommandApproval" "applyPatchApproval")
+            {"decision" (if (= decision :deny) "denied" "approved")}
+            "mcpServer/elicitation/request"
+            {"action" (if (= decision :deny) "decline" "accept")
+             "content" (when answers {})}
+            {"decision" (case decision
+                          :allow "accept"
+                          :allow-session "acceptForSession"
+                          :deny "decline")})})
+      (emit! a :request-resolved :id request-id))))
+
+;;; Reading
+
+(defn item-activity
+  "[label detail] of an item that isn't a reply, or nil."
+  [item]
+  (case (get item "type")
+    "commandExecution" ["Command" (agents/truncate (get item "command") 200)]
+    "fileChange" ["Edit" (string/join ", " (map (fn [c] (or (get c "path") ""))
+                                                (get item "changes")))]
+    "mcpToolCall" [(or (get item "tool") "Tool") (or (get item "server") "")]
+    "dynamicToolCall" [(or (get item "tool") "Studio") ""]
+    "webSearch" ["Web search" (or (get item "query") "")]
+    nil))
+
+(def ^:private ordinary-approvals
+  #{"item/commandExecution/requestApproval" "item/fileChange/requestApproval"
+    "execCommandApproval" "applyPatchApproval"})
+
+(defn- approval-title [method]
+  (cond (string/includes? method "commandExecution") "Run this command?"
+        (string/includes? method "fileChange") "Apply these edits?"
+        (string/includes? method "permissions") "Grant extra permissions?"
+        (string/includes? method "elicitation") "A tool needs your input"
+        :else "Allow this?"))
+
+(defn- server-request! [a rpc-id method params]
+  (let [k (str rpc-id)]
+    (cond
+      (= method "item/tool/call")
+      (emit! a :tool-call :name (get params "tool") :arguments (or (get params "arguments") {})
+             :reply (fn [text error?]
+                      (send-json! a {"id" rpc-id
+                                     "result" {"success" (not error?)
+                                               "contentItems" [{"type" "inputText"
+                                                                "text" text}]}})))
+      (contains? #{"account/chatgptAuthTokens/refresh" "attestation/generate"
+                   "currentTime/read"}
+                 method)
+      (send-json! a {"id" rpc-id "error" {"code" -32601
+                                          "message" "Not supported by Skein Studio."}})
+      :else
+      (let [ordinary (contains? ordinary-approvals method)]
+        (swap! (:state a) assoc-in [:requests k] [rpc-id method params])
+        (cond
+          ;; :auto accepts ordinary approvals, never extra permissions
+          (and ordinary (= :auto (state a :autonomy)) (nil? (get params "additionalPermissions")))
+          (answer a k :allow nil)
+          (= method "item/tool/requestUserInput")
+          (emit! a :request
+                 :request {:id k :kind :question :title "Question"
+                           :questions (mapv (fn [q]
+                                              {:id (get q "id") :header (get q "header")
+                                               :text (get q "question") :multiple false
+                                               :secret (boolean (get q "isSecret"))
+                                               :options (agents/question-options
+                                                         (get q "options"))})
+                                            (get params "questions"))})
+          :else
+          (let [d (or (get params "command") (get params "reason") (get params "message") "")]
+            (emit! a :request
+                   :request {:id k :kind :approval :title (approval-title method)
+                             :detail (agents/truncate (if (string? d) d (string/join " " d)) 400)
+                             :options (if ordinary
+                                        [{:value :allow :label "Allow"}
+                                         {:value :allow-session :label "Allow for session"}
+                                         {:value :deny :label "Deny"}]
+                                        [{:value :allow :label "Allow"}
+                                         {:value :deny :label "Deny"}])})))))))
+
+(defn- item! [a params done]
+  (let [item (get params "item")]
+    (if (= "agentMessage" (get item "type"))
+      (when done (emit! a :message :item (get item "id") :text (or (get item "text") "")))
+      (when-let [[label detail] (item-activity item)]
+        (emit! a :activity :item (get item "id") :label label :detail detail
+               :output (when done (agents/truncate (get item "aggregatedOutput") 4000))
+               :state (cond (not done) :running
+                            (contains? #{"failed" "declined"} (get item "status")) :failed
+                            :else :done))))))
+
+(defn- on-line! [a line]
+  (when-let [object (agents/read-json line)]
+    (let [method (get object "method")
+          params (get object "params")
+          id (get object "id")]
+      (cond
+        (and method (some? id)) (server-request! a id method params)
+        (some? id)
+        (let [callback (get-in (state a) [:pending id])]
+          (swap! (:state a) update :pending dissoc id)
+          (when callback
+            (callback (get object "result")
+                      (when-let [e (get object "error")]
+                        (or (get e "message") "Codex reported an error.")))))
+        :else
+        (case method
+          "turn/started" (do (swap! (:state a) assoc :turn (jget params "turn" "id"))
+                             (flush-steering! a))
+          "item/agentMessage/delta" (emit! a :text :item (get params "itemId")
+                                           :delta (or (get params "delta") ""))
+          "item/started" (item! a params false)
+          "item/completed" (item! a params true)
+          "account/rateLimits/updated" (emit! a :limits
+                                              :windows (agents/codex-limit-windows params))
+          "thread/tokenUsage/updated"
+          (emit! a :usage :context-used (jget params "tokenUsage" "last" "totalTokens")
+                 :context-window (jget params "tokenUsage" "modelContextWindow"))
+          "turn/completed" (do (swap! (:state a) assoc :busy false :turn nil)
+                               (emit! a :turn-done :error (jget params "turn" "error" "message"))
+                               (emit! a :status :status :idle))
+          "serverRequest/resolved" (let [k (str (get params "requestId"))]
+                                     (swap! (:state a) update :requests dissoc k)
+                                     (emit! a :request-resolved :id k))
+          "error" (emit! a :activity :item (str "error-" (random-uuid)) :label "Error"
+                         :detail (or (jget params "error" "message") "Codex reported an error.")
+                         :state :failed)
+          nil)))))
+
+(def impl
+  "Codex's functions for skein.studio.agents."
+  {:start start :send send-message :steer steer :interrupt interrupt :answer answer
+   :stop stop :choose-model choose-model})
+
+(defn adapter
+  "A Codex adapter (see skein.studio.agents for opts)."
+  [opts]
+  (agents/make-adapter :codex impl opts))

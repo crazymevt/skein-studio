@@ -34,3 +34,7 @@ The tests run headless, and on Cocoa and GTK where those can open a window; some
 program under a real `skein dev`. The scripted session (`examples/session.edn`, run by
 `skein.studio.script`) drives the IDE as a user would: it opens `examples/sample`, runs
 it, edits and evaluates, hits an error and restarts. CI runs both on macOS and Linux.
+
+The agents' adapters are tested without Claude Code or Codex: `tools/stand-in.skn` speaks
+either CLI's protocol from an EDN script (`test/agents/`), and `agents-test` builds it and
+drives each adapter through a turn.

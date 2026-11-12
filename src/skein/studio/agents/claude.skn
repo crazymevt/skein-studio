@@ -1,0 +1,307 @@
+(ns skein.studio.agents.claude
+  "Claude Code through claude -p and stream-json (Skein's M3.8, D-110), as Lisp Studio
+has it. Permission prompts arrive as can_use_tool control requests (the stdio permission
+prompt tool); the IDE's tools are an SDK MCP server named \"studio\" (Claude Code keeps
+\"ide\" for its own editor integration), whose JSON-RPC messages travel inside mcp_message
+control requests."
+  (:require [skein.string :as string]
+            [skein.json :as json]
+            [skein.studio.agents :as agents :refer [jget emit! state]]))
+
+(def auto-tools
+  "The tools whose permission prompts :auto accepts."
+  #{"Bash" "Edit" "Write" "MultiEdit" "NotebookEdit" "Read" "Glob" "Grep" "LS" "WebFetch"
+    "WebSearch" "TodoWrite" "Task" "Agent" "BashOutput" "KillShell" "KillBash"})
+
+(defn arguments
+  "The CLI's arguments for the adapter's state now."
+  [a]
+  (let [{:keys [autonomy model effort session-id]} (state a)]
+    (vec (concat
+          ["-p" "--input-format" "stream-json" "--output-format" "stream-json" "--verbose"
+           "--include-partial-messages" "--replay-user-messages"
+           "--permission-prompt-tool" "stdio"
+           "--permission-mode" (if (= autonomy :auto) "acceptEdits" "default")]
+          (when (= autonomy :read-only)
+            ["--disallowedTools" "Edit,Write,MultiEdit,NotebookEdit"])
+          (when-not (string/blank? (:instructions a))
+            ["--append-system-prompt" (:instructions a)])
+          (when model ["--model" model])
+          (when effort ["--effort" effort])
+          (when session-id ["--resume" session-id])
+          ["--mcp-config" (json/write-str {"mcpServers" {"studio" {"type" "sdk"
+                                                                    "name" "studio"}}})
+           "--allowedTools" "mcp__studio__*"]))))
+
+(defn- cli [a] (state a :cli))
+
+(defn- send-json! [a x] (agents/send-json! (cli a) x))
+
+(defn- control!
+  "Send a control request; callback, if any, gets the response and an error message."
+  ([a subtype fields] (control! a subtype fields nil))
+  ([a subtype fields callback]
+   (let [id (str "ide-" (:next-request (swap! (:state a) update :next-request (fnil inc 0))))]
+     (when callback (swap! (:state a) assoc-in [:pending id] callback))
+     (send-json! a {"type" "control_request" "request_id" id
+                    "request" (assoc fields "subtype" subtype)}))))
+
+(defn- respond! [a id response]
+  (send-json! a {"type" "control_response"
+                 "response" {"subtype" "success" "request_id" id "response" response}}))
+
+(defn models
+  "Claude's models as the events give them; its \"default\" entry is the CLI's own choice,
+which marks the alias it resolves to."
+  [ms]
+  (let [default (first (filter (fn [m] (= "default" (get m "value"))) ms))]
+    (vec (for [m ms
+               :let [id (get m "value")]
+               :when (not= id "default")]
+           {:id id
+            :label (or (get m "displayName") id)
+            :description (get m "description")
+            :default (boolean (and default (not (string/includes? id "-"))
+                                   (= (get m "resolvedModel") (get default "resolvedModel"))))
+            :efforts (when (get m "supportsEffort") (vec (get m "supportedEffortLevels")))}))))
+
+;;; Writing
+
+(def ^:private on-line!)
+
+(defn- start [a]
+  (emit! a :status :status :starting)
+  (swap! (:state a) assoc :unconsumed [] :replays-seen false :pending {} :requests {})
+  (let [c (agents/start-cli! (agents/cli-command a (arguments a)) (:folder a)
+                             (fn [line] (on-line! a line))
+                             (fn [code err] (emit! a :exited :code code :stderr err))
+                             (fn [message] (emit! a :notice :text message)))]
+    (swap! (:state a) assoc :cli c)
+    (control! a "initialize" {"sdkMcpServers" ["studio"]}
+              (fn [response error]
+                (if error
+                  (emit! a :status :status :error :message error)
+                  (do (emit! a :models :models (models (get response "models")))
+                      (emit! a :status :status :idle)))))))
+
+(defn content
+  "A user message's content: text alone, or text and the images, in base64."
+  [text images]
+  (let [images (agents/sendable-images images)]
+    (if (empty? images)
+      text
+      (into [{"type" "text" "text" text}]
+            (for [path images]
+              {"type" "image"
+               "source" {"type" "base64" "media_type" (agents/image-media-type path)
+                         "data" (agents/image-base64 path)}})))))
+
+(defn- send-message [a text images]
+  (let [id (str (random-uuid))]
+    (swap! (:state a) update :unconsumed conj id)
+    (emit! a :status :status :busy)
+    (send-json! a {"type" "user" "uuid" id
+                   "message" {"role" "user" "content" (content text images)}})))
+
+(defn- interrupt [a]
+  (when (agents/cli-alive? (cli a))
+    (control! a "interrupt" {})))
+
+(defn- stop [a]
+  (agents/stop-cli! (cli a))
+  (swap! (:state a) dissoc :cli))
+
+(defn- question-answers
+  "AskUserQuestion's answers, keyed by the questions' text."
+  [questions answers]
+  (into {} (map-indexed (fn [i q]
+                          (let [v (get answers (str i) "")]
+                            [(or (get q "question") (str i))
+                             (if (sequential? v) (string/join ", " v) v)]))
+                        questions)))
+
+(defn- answer [a request-id decision answers]
+  (let [input (get-in (state a) [:requests request-id])]
+    (swap! (:state a) update :requests dissoc request-id)
+    (when input
+      (respond! a request-id
+                (cond (= decision :deny)
+                      {"behavior" "deny" "message" "The user declined this."}
+                      answers
+                      {"behavior" "allow"
+                       "updatedInput" (assoc input "answers"
+                                             (question-answers (get input "questions")
+                                                               answers))}
+                      :else {"behavior" "allow" "updatedInput" input}))
+      (emit! a :request-resolved :id request-id))))
+
+;;; Reading
+
+(defn summarize-input
+  "A line saying what a tool call does, from its input."
+  [tool input]
+  (let [v (some (fn [k] (get input k))
+                ["command" "file_path" "path" "pattern" "url" "query" "description"])]
+    (if (string? v) (agents/truncate (string/trim v) 160) (or tool ""))))
+
+(defn- content-text
+  "The text of a tool result's content: a string, or blocks."
+  [c]
+  (cond (string? c) c
+        (sequential? c) (string/join "\n" (keep (fn [b] (when (= "text" (get b "type"))
+                                                          (get b "text")))
+                                                c))
+        :else ""))
+
+(defn- mcp! [a request-id message]
+  (let [id (get message "id")
+        method (get message "method")
+        reply (fn [result]
+                (respond! a request-id
+                          {"mcp_response" (if (some? id)
+                                            {"jsonrpc" "2.0" "id" id "result" result}
+                                            {})}))]
+    (case method
+      "initialize" (reply {"protocolVersion" "2024-11-05" "capabilities" {"tools" {}}
+                           "serverInfo" {"name" "studio" "version" "0.1.0"}})
+      "tools/list" (reply {"tools" (mapv (fn [t] {"name" (:name t)
+                                                  "description" (:description t)
+                                                  "inputSchema" (:schema t)})
+                                         (:tools a))})
+      "tools/call" (emit! a :tool-call :name (jget message "params" "name")
+                          :arguments (or (jget message "params" "arguments") {})
+                          :reply (fn [text error?]
+                                   (reply {"content" [{"type" "text" "text" text}]
+                                           "isError" (boolean error?)})))
+      (reply {}))))
+
+(defn- control-request! [a id request]
+  (case (get request "subtype")
+    "mcp_message" (mcp! a id (get request "message"))
+    "can_use_tool"
+    (let [tool (get request "tool_name")
+          input (or (get request "input") {})]
+      (swap! (:state a) assoc-in [:requests id] input)
+      (cond
+        (= tool "AskUserQuestion")
+        (emit! a :request
+               :request {:id id :kind :question :title "Question"
+                         :questions
+                         (vec (map-indexed
+                               (fn [i q]
+                                 {:id (str i) :header (get q "header") :text (get q "question")
+                                  :multiple (boolean (get q "multiSelect"))
+                                  :options (agents/question-options (get q "options"))})
+                               (get input "questions")))})
+        (and (= :auto (state a :autonomy)) (contains? auto-tools tool))
+        (answer a id :allow nil)
+        :else
+        (emit! a :request
+               :request {:id id :kind :approval :title (str "Allow " tool "?")
+                         :detail (summarize-input tool input)
+                         :options [{:value :allow :label "Allow"}
+                                   {:value :deny :label "Deny"}]})))
+    (respond! a id {})))
+
+(defn- stream-event! [a event]
+  ;; Text blocks are keyed by their ordinal among the message's text blocks: stream
+  ;; indexes count thinking and tool blocks too, and the finished blocks come in
+  ;; assistant events, numbered differently.
+  (let [kind (get event "type")
+        message-id (state a :message-id)]
+    (cond
+      (= kind "message_start")
+      (swap! (:state a) (fn [s] (cond-> (assoc s :message-id (jget event "message" "id"))
+                                  (> (count (:stream-blocks s)) 200)
+                                  (assoc :stream-blocks {} :final-blocks {}))))
+      (and (= kind "content_block_start") (= "text" (jget event "content_block" "type")))
+      (swap! (:state a) update-in [:stream-blocks message-id] (fnil inc 0))
+      (and (= kind "content_block_delta") (= "text_delta" (jget event "delta" "type")))
+      (emit! a :text :item (str message-id "/" (or (get-in (state a) [:stream-blocks message-id])
+                                                   1))
+             :delta (or (jget event "delta" "text") "")))))
+
+(defn- assistant! [a object]
+  (let [id (jget object "message" "id")]
+    (doseq [block (jget object "message" "content")]
+      (case (get block "type")
+        "text" (let [n (get-in (swap! (:state a) update-in [:final-blocks id] (fnil inc 0))
+                               [:final-blocks id])]
+                 (emit! a :message :item (str id "/" n) :text (or (get block "text") "")))
+        "tool_use" (emit! a :activity :item (get block "id") :label (get block "name")
+                          :detail (summarize-input (get block "name") (get block "input"))
+                          :state :running)
+        nil))))
+
+(defn- result! [a object]
+  ;; Idle unless a message sent is still unread: it starts a new turn. (A CLI that never
+  ;; echoes messages back is idle after every result.)
+  (let [s (swap! (:state a) (fn [s] (if (:replays-seen s) s (assoc s :unconsumed []))))]
+    (when-let [id (get object "session_id")] (swap! (:state a) assoc :session-id id))
+    (emit! a :turn-done :error (when (get object "is_error")
+                                 (let [r (get object "result")]
+                                   (if (string? r) r "Claude reported an error."))))
+    (when (empty? (:unconsumed s)) (emit! a :status :status :idle))
+    (control! a "get_context_usage" {}
+              (fn [r error]
+                (when-not error
+                  (emit! a :usage :context-used (or (get r "totalTokens") (get r "usedTokens"))
+                         :context-window (or (get r "maxTokens") (get r "contextWindow"))))))))
+
+(defn- on-line! [a line]
+  (when-let [object (agents/read-json line)]
+    (let [type (get object "type")]
+      (cond
+        (and (= type "system") (= "init" (get object "subtype")))
+        (when-let [id (get object "session_id")]
+          (swap! (:state a) assoc :session-id id)
+          (emit! a :session :id id))
+        (= type "stream_event") (stream-event! a (get object "event"))
+        (= type "assistant") (assistant! a object)
+        (= type "rate_limit_event")
+        (let [ws (agents/merge-limit-windows (state a :limits)
+                                             (agents/claude-limit-windows
+                                              (get object "rate_limit_info")))]
+          (swap! (:state a) assoc :limits ws)
+          (emit! a :limits :windows ws))
+        (and (= type "user") (get object "isReplay"))
+        (swap! (:state a) (fn [s] (-> s
+                                      (assoc :replays-seen true)
+                                      (update :unconsumed
+                                              (fn [u] (filterv (fn [x] (not= x (get object "uuid")))
+                                                               u))))))
+        (= type "user")
+        (doseq [block (jget object "message" "content")]
+          (when (= "tool_result" (get block "type"))
+            (emit! a :activity :item (get block "tool_use_id")
+                   :output (agents/truncate (content-text (get block "content")) 4000)
+                   :state (if (get block "is_error") :failed :done))))
+        (= type "control_request")
+        (control-request! a (get object "request_id") (get object "request"))
+        (= type "control_cancel_request")
+        (let [id (get object "request_id")]
+          (swap! (:state a) update :requests dissoc id)
+          (emit! a :request-resolved :id id))
+        (= type "control_response")
+        (let [response (get object "response")
+              id (get response "request_id")
+              callback (get-in (state a) [:pending id])]
+          (swap! (:state a) update :pending dissoc id)
+          (when callback
+            (callback (get response "response")
+                      (when (= "error" (get response "subtype"))
+                        (or (get response "error") "error")))))
+        (= type "result") (result! a object)))))
+
+(def impl
+  "Claude Code's functions for skein.studio.agents."
+  {:start start :send send-message
+   ;; A message sent mid-turn is read at Claude's next step, or as the next turn; the
+   ;; replayed messages' ids tell which.
+   :steer send-message
+   :interrupt interrupt :answer answer :stop stop})
+
+(defn adapter
+  "A Claude Code adapter (see skein.studio.agents for opts)."
+  [opts]
+  (agents/make-adapter :claude impl opts))

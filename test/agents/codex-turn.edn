@@ -1,0 +1,45 @@
+;; A turn of Codex's app-server JSON-RPC, for tools/stand-in.skn (agents-test): the
+;; initialize handshake, models, limits and a new thread; a turn that streams text, is
+;; steered, asks to run a command (allowed for the session), runs it, calls one of the
+;; IDE's tools, reports usage and completes.
+[[:expect {"method" "initialize"}]
+ [:send {"id" "$last.id" "result" {}}]
+ [:expect {"method" "initialized"}]
+ [:expect {"method" "model/list"}]
+ [:send {"id" "$last.id"
+         "result" {"data" [{"id" "gpt-5" "displayName" "GPT-5" "isDefault" true
+                            "supportedReasoningEfforts" [{"reasoningEffort" "low"}
+                                                         {"reasoningEffort" "high"}]
+                            "defaultReasoningEffort" "high"}
+                           {"id" "hidden-one" "hidden" true}]}}]
+ [:expect {"method" "account/rateLimits/read"}]
+ [:send {"id" "$last.id"
+         "result" {"rateLimits" {"primary" {"usedPercent" 40 "windowDurationMins" 300
+                                            "resetsAt" 1800000000}
+                                 "secondary" {"usedPercent" 10 "windowDurationMins" 10080}}}}]
+ [:expect {"method" "thread/start" "params.sandbox" "workspace-write"
+           "params.approvalPolicy" "untrusted"}]
+ [:send {"id" "$last.id" "result" {"thread" {"id" "th-1"}}}]
+ [:expect {"method" "turn/start" "params.threadId" "th-1"}]
+ [:send {"id" "$last.id" "result" {"turn" {"id" "tu-1"}}}]
+ [:send {"method" "turn/started" "params" {"turn" {"id" "tu-1"}}}]
+ [:send {"method" "item/agentMessage/delta" "params" {"itemId" "msg-1" "delta" "Hel"}}]
+ [:expect {"method" "turn/steer" "params.expectedTurnId" "tu-1"}]
+ [:send {"id" "$last.id" "result" {}}]
+ [:send {"method" "item/agentMessage/delta" "params" {"itemId" "msg-1" "delta" "lo"}}]
+ [:send {"method" "item/completed"
+         "params" {"item" {"type" "agentMessage" "id" "msg-1" "text" "Hello"}}}]
+ [:send {"id" 100 "method" "item/commandExecution/requestApproval"
+         "params" {"command" "ls" "itemId" "c1"}}]
+ [:expect {"id" 100 "result.decision" "acceptForSession"}]
+ [:send {"method" "item/started"
+         "params" {"item" {"type" "commandExecution" "id" "c1" "command" "ls"}}}]
+ [:send {"method" "item/completed"
+         "params" {"item" {"type" "commandExecution" "id" "c1" "command" "ls"
+                           "aggregatedOutput" "a.txt" "status" "completed"}}}]
+ [:send {"id" 101 "method" "item/tool/call"
+         "params" {"tool" "ide_problems" "arguments" {"file" "a.skn"}}}]
+ [:expect {"id" 101 "result.success" true}]
+ [:send {"method" "thread/tokenUsage/updated"
+         "params" {"tokenUsage" {"last" {"totalTokens" 900} "modelContextWindow" 400000}}}]
+ [:send {"method" "turn/completed" "params" {"turn" {"id" "tu-1"}}}]]

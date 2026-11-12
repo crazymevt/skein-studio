@@ -1,0 +1,195 @@
+(ns skein.studio.agents-test
+  (:require [skein.test :refer [deftest is are testing]]
+            [skein.io :as io]
+            [skein.process :as process]
+            [skein.string :as string]
+            [skein.studio.inferior :as inferior]
+            [skein.studio.agents :as agents]
+            [skein.studio.agents.claude :as claude]
+            [skein.studio.agents.codex :as codex]))
+
+;; The agents' adapters (Skein's M3.8 step 2, D-110): what they send, from their state, and
+;; each driven through a turn by tools/stand-in.skn speaking its CLI's protocol.
+
+(def ^:private tools
+  [{:name "ide_problems" :description "The problems in a file."
+    :schema (agents/tool-schema {"file" {"type" "string"}} ["file"])}])
+
+(deftest claude-arguments
+  (let [a (claude/adapter {:folder "/p" :instructions "Be brief." :tools tools})
+        args (claude/arguments a)
+        after (fn [flag] (second (drop-while (fn [x] (not= x flag)) args)))]
+    (is (= "acceptEdits" (after "--permission-mode")) ":auto accepts edits")
+    (is (= "Be brief." (after "--append-system-prompt")))
+    (is (= "mcp__studio__*" (after "--allowedTools")))
+    (is (nil? (after "--resume")))
+    (agents/set-autonomy! a :read-only)
+    (swap! (:state a) assoc :session-id "s-9" :model "opus")
+    (let [args (claude/arguments a)
+          after (fn [flag] (second (drop-while (fn [x] (not= x flag)) args)))]
+      (is (= "default" (after "--permission-mode")))
+      (is (= "Edit,Write,MultiEdit,NotebookEdit" (after "--disallowedTools")))
+      (is (= ["s-9" "opus"] [(after "--resume") (after "--model")])))))
+
+(deftest codex-thread-params
+  (let [a (codex/adapter {:folder "/p" :tools tools :autonomy :ask})
+        p (codex/thread-params a)]
+    (is (= ["/p" "untrusted" "workspace-write"]
+           [(get p "cwd") (get p "approvalPolicy") (get p "sandbox")]))
+    (is (= ["ide_problems"] (mapv (fn [t] (get t "name")) (get p "dynamicTools"))))
+    (is (not (contains? p "model")) "nothing for the CLI's defaults")
+    (swap! (:state a) assoc :session-id "th-2" :autonomy :read-only)
+    (let [p (codex/thread-params a)]
+      (is (= ["th-2" "read-only"] [(get p "threadId") (get p "sandbox")]))
+      (is (not (contains? p "dynamicTools")) "a thread keeps its tools"))))
+
+(deftest models-and-limits
+  (is (= [{:id "opus" :label "Opus" :description nil :default true :efforts ["low"]}
+          {:id "sonnet" :label "sonnet" :description nil :default false :efforts nil}]
+         (claude/models [{"value" "default" "resolvedModel" "x-opus"}
+                         {"value" "opus" "displayName" "Opus" "resolvedModel" "x-opus"
+                          "supportsEffort" true "supportedEffortLevels" ["low"]}
+                         {"value" "sonnet" "resolvedModel" "x-sonnet"}])))
+  (is (= [{:id "gpt-5" :label "gpt-5" :description nil :default false :efforts []
+           :default-effort nil}]
+         (codex/models [{"id" "gpt-5"} {"id" "x" "hidden" true}])))
+  (is (= [{:id "codex/primary" :label "5h" :remaining 60 :reset 1}
+          {:id "codex/secondary" :label "7d" :remaining 90 :reset nil}]
+         (agents/codex-limit-windows
+          {"rateLimits" {"primary" {"usedPercent" 40 "windowDurationMins" 300 "resetsAt" 1}
+                         "secondary" {"usedPercent" 10 "windowDurationMins" 10080}}})))
+  (let [ws (agents/claude-limit-windows
+            {"unifiedWindows" {"five_hour" {"utilization" 1.0 "status" "rejected"}
+                               "seven_day" {"utilization" 0.5}}})]
+    (is (= [["5h" 0] ["7d" 50]] (mapv (juxt :label :remaining) ws)))
+    (is (= [true false] (mapv agents/limit-exhausted? ws)))
+    (is (= ["five_hour" "seven_day"]
+           (mapv :id (agents/merge-limit-windows [{:id "five_hour" :remaining 99}] ws))))))
+
+(deftest small-parts
+  (is (= 12 (count (agents/tools-version tools))))
+  (is (= (agents/tools-version tools) (agents/tools-version tools)))
+  (is (not= (agents/tools-version tools) (agents/tools-version [])))
+  (is (= "image/png" (agents/image-media-type "a/B.PNG")))
+  (is (nil? (agents/image-media-type "notes.txt")))
+  (is (= "ls -la" (claude/summarize-input "Bash" {"command" " ls -la "})))
+  (is (= "Edit" (claude/summarize-input "Edit" {})))
+  (is (= ["Command" "make"] (codex/item-activity {"type" "commandExecution" "command" "make"})))
+  (is (nil? (codex/item-activity {"type" "reasoning"})))
+  (is (= "hi" (claude/content "hi" ["missing.png"])) "no image to send: text alone")
+  (is (= "abcd…" (agents/truncate "abcdefgh" 5))))
+
+;;; Through a turn, against the stand-in
+
+(def ^:private stand-in
+  ;; tools/stand-in.skn, built once
+  (delay (let [out (io/path (io/temp-dir "stand-in") "stand-in")
+               r (io/run-process [(io/path (inferior/skein-home) "build/skeinc") "build"
+                                  (io/absolute-path "tools/stand-in.skn") "-o" out])]
+           (when-not (zero? (:exit r))
+             (error (str "building the stand-in failed: " (:err r) (:out r))))
+           out)))
+
+(defn- events-of [events type] (filterv (fn [e] (= type (:type e))) @events))
+
+(defn- wait-for [secs done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n (* secs 20)) (done?)
+          :else (do (sleep 0.05) (recur (inc n))))))
+
+(defn- run-turn
+  "Start an adapter made by make on the stand-in with script, as autonomy :ask, and
+handle its requests and tool calls as the IDE would; returns its events."
+  [make script on-text]
+  (let [events (atom [])
+        a (make {:name "agent" :folder (io/absolute-path ".") :tools tools :autonomy :ask
+                 :program [@stand-in (io/absolute-path script)]
+                 :sink (fn [e] (swap! events conj e))})]
+    (try
+      (agents/start! a)
+      (is (wait-for 30 (fn [] (seq (filter (fn [e] (= :idle (:status e))) @events))))
+          "the handshake")
+      (agents/send! a "hi")
+      (let [handled (atom #{})]
+        (is (wait-for 30 (fn []
+                           (doseq [e @events
+                                   :when (not (contains? @handled e))]
+                             (swap! handled conj e)
+                             (case (:type e)
+                               :request (agents/answer! a (:id (:request e))
+                                                        (if (= :codex (:provider a))
+                                                          :allow-session
+                                                          :allow))
+                               :tool-call ((:reply e) (str "no problems in "
+                                                           (get (:arguments e) "file"))
+                                           false)
+                               :text (on-text a e)
+                               nil))
+                           (seq (events-of events :turn-done))))
+            (pr-str (mapv :type @events))))
+      (is (wait-for 10 (fn [] (seq (events-of events :usage)))))
+      (agents/stop! a)
+      (is (wait-for 10 (fn [] (seq (events-of events :exited)))))
+      @events
+      (finally (agents/stop! a)))))
+
+(deftest claude-through-a-turn
+  (let [events (run-turn claude/adapter "test/agents/claude-turn.edn" (fn [a e] nil))
+        of (fn [t] (filterv (fn [e] (= t (:type e))) events))]
+    (is (every? (fn [e] (= "agent" (:agent e))) events))
+    (is (= [:starting :idle :busy :idle] (mapv :status (of :status))))
+    (is (= ["opus" "sonnet"] (mapv :id (:models (first (of :models))))))
+    (is (= "s-1" (:id (first (of :session)))))
+    (is (= [["m1/1" "Hel"] ["m1/1" "lo"]] (mapv (juxt :item :delta) (of :text))))
+    (is (= [["m1/1" "Hello"]] (mapv (juxt :item :text) (of :message))) "the same item")
+    (is (= [["t1" :running "ls"] ["t1" :done "a.txt"]]
+           (mapv (juxt :item :state (fn [e] (or (:output e) (:detail e)))) (of :activity))))
+    (let [r (:request (first (of :request)))]
+      (is (= [:approval "Allow Bash?" "ls"] ((juxt :kind :title :detail) r)))
+      (is (= [(:id r)] (mapv :id (of :request-resolved)))))
+    (is (= [["ide_problems" {"file" "a.skn"}]] (mapv (juxt :name :arguments) (of :tool-call))))
+    (is (= [["5h" 75]] (mapv (juxt :label :remaining) (:windows (first (of :limits))))))
+    (is (= [nil] (mapv :error (of :turn-done))))
+    (is (= [[1200 200000]] (mapv (juxt :context-used :context-window) (of :usage))))
+    (is (= 0 (:code (first (of :exited)))) (:stderr (first (of :exited))))))
+
+(deftest codex-through-a-turn
+  (let [steered (atom false)
+        events (run-turn codex/adapter "test/agents/codex-turn.edn"
+                         (fn [a e] (when-not @steered
+                                     (reset! steered true)
+                                     (agents/steer! a "and briefly"))))
+        of (fn [t] (filterv (fn [e] (= t (:type e))) events))]
+    (is (= [:starting :idle :busy :idle] (mapv :status (of :status))))
+    (is (= [["gpt-5" true ["low" "high"] "high"]]
+           (mapv (juxt :id :default :efforts :default-effort) (:models (first (of :models))))))
+    (is (= ["5h" "7d"] (mapv :label (:windows (first (of :limits))))))
+    (is (= [["th-1" (agents/tools-version tools)]] (mapv (juxt :id :tools) (of :session))))
+    (is (= ["Hel" "lo"] (mapv :delta (of :text))))
+    (is (= [["msg-1" "Hello"]] (mapv (juxt :item :text) (of :message))))
+    (let [r (:request (first (of :request)))]
+      (is (= [:approval "Run this command?" "ls" 3]
+             ((juxt :kind :title :detail (comp count :options)) r)))
+      (is (= ["100"] (mapv :id (of :request-resolved)))))
+    (is (= [["c1" :running nil] ["c1" :done "a.txt"]]
+           (mapv (juxt :item :state :output) (of :activity))))
+    (is (= [["ide_problems" {"file" "a.skn"}]] (mapv (juxt :name :arguments) (of :tool-call))))
+    (is (= [[900 400000]] (mapv (juxt :context-used :context-window) (of :usage))))
+    (is (= [nil] (mapv :error (of :turn-done))))
+    (is (= 0 (:code (first (of :exited)))) (:stderr (first (of :exited))))))
+
+(deftest a-script-that-isnt-followed
+  ;; The stand-in says on stderr what it waited for when its input ends first.
+  (let [events (atom [])
+        script (io/path (io/temp-dir "stand-in-script") "never.edn")
+        _ (io/write-file script "[[:expect {\"method\" \"never/sent\"}]]")
+        a (codex/adapter {:folder (io/absolute-path ".") :program [@stand-in script]
+                          :sink (fn [e] (swap! events conj e))})]
+    (agents/start! a)
+    (is (wait-for 10 (fn [] (seq (events-of events :status)))))
+    (agents/stop! a)
+    (is (wait-for 10 (fn [] (seq (events-of events :exited)))))
+    (let [e (first (events-of events :exited))]
+      (is (not= 0 (:code e)))
+      (is (string/includes? (str (:stderr e)) "never/sent") (pr-str e)))))

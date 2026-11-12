@@ -1,0 +1,341 @@
+(ns skein.studio.agents
+  "Coding agents through their CLIs (Skein's M3.8, D-110), as Lisp Studio has them: Claude
+Code (claude -p, stream-json; skein.studio.agents.claude) and Codex (codex app-server,
+JSON-RPC over stdio; skein.studio.agents.codex), each an adapter that runs its CLI and turns
+its protocol into the same events, given to the adapter's sink:
+
+  {:type :status :status s}           :starting :idle :busy :error (with :message) :stopped
+  {:type :text :item id :delta s}     reply text as it streams
+  {:type :message :item id :text s}   a reply item, finished
+  {:type :activity :item id :label l :detail d :output o :state s}
+                                      a tool call, command or edit: :running :done :failed
+  {:type :request :request r}         an approval or a question for the user: r has :id,
+                                      :kind (:approval or :question), :title, :detail,
+                                      :options [{:value :label}] or :questions
+  {:type :request-resolved :id id}
+  {:type :tool-call :name n :arguments m :reply f}
+                                      one of the IDE's tools; (f text error?) answers it
+  {:type :turn-done :error e}         e a message, or nil
+  {:type :usage :context-used n :context-window n}
+  {:type :session :id id :tools v}    the CLI's conversation, and the tools' version
+  {:type :notice :text s}             something the user should know
+  {:type :reset}                      the conversation starts afresh
+  {:type :limits :windows ws}         the account's usage windows (limit-windows)
+  {:type :models :models ms}          {:id :label :description :default :efforts
+                                       :default-effort}
+  {:type :exited :code n :stderr s}
+
+Every event also has :agent, the adapter's name. The sink is called on the adapter's own
+fibers: it should only hand the event on (to the UI's thread, say).
+
+An adapter is a map: :provider, :name, :folder, :sink, :program (the CLI's path, or a
+vector of a program and its first arguments; found on the PATH when nil), :tools (the
+IDE's: {:name :description :schema}), :instructions, :impl (the provider's functions) and
+:state, an atom of what changes: :session-id, :model, :effort, :autonomy (:auto accepts
+ordinary edits and commands, :ask asks about each, :read-only), the CLI and the
+provider's own."
+  (:require [skein.io :as io]
+            [skein.json :as json]
+            [skein.bytes :as bytes]
+            [skein.string :as string]
+            [skein.system :as system]
+            [skein.math :as math]
+            [skein.process :as process]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Adapters
+
+(defn make-adapter
+  "An adapter of provider (:claude or :codex) with impl, its functions; opts give :name,
+:folder, :sink, :program, :tools, :instructions, and to begin with :session-id, :model,
+:effort and :autonomy (default :auto)."
+  [provider impl opts]
+  {:provider provider
+   :name (or (:name opts) (name provider))
+   :folder (:folder opts)
+   :sink (:sink opts)
+   :program (:program opts)
+   :tools (vec (:tools opts))
+   :instructions (or (:instructions opts) "")
+   :impl impl
+   :state (atom (merge {:autonomy :auto}
+                       (select-keys opts [:session-id :model :effort :autonomy :session-tools])))})
+
+(defn state
+  "The adapter's state now, or one key of it."
+  ([a] @(:state a))
+  ([a k] (get @(:state a) k)))
+
+(defn emit!
+  "Give the adapter's sink an event of type with fields."
+  [a type & {:as fields}]
+  (when-let [sink (:sink a)]
+    (sink (assoc fields :type type :agent (:name a)))))
+
+(defn start!
+  "Run the CLI and open the conversation, or resume the one in :session-id."
+  [a]
+  ((:start (:impl a)) a))
+
+(defn send!
+  "Start a turn with text and images (paths of image files)."
+  ([a text] (send! a text []))
+  ([a text images] ((:send (:impl a)) a text images)))
+
+(defn steer!
+  "Add text and images to the turn under way (or start one)."
+  ([a text] (steer! a text []))
+  ([a text images] ((:steer (:impl a)) a text images)))
+
+(defn interrupt!
+  "Stop the turn under way."
+  [a]
+  ((:interrupt (:impl a)) a))
+
+(defn answer!
+  "Answer the request request-id: decision :allow, :allow-session or :deny for an approval,
+or answers for a question, {question-id answer}, an answer a string or several."
+  ([a request-id decision] (answer! a request-id decision nil))
+  ([a request-id decision answers] ((:answer (:impl a)) a request-id decision answers)))
+
+(defn stop!
+  "End the CLI."
+  [a]
+  ((:stop (:impl a)) a))
+
+(defn choose-model!
+  "Use model and effort (nil for the CLI's default): :next-turn when they apply from the
+next turn, :restart when the CLI must start again (resuming the conversation)."
+  [a model effort]
+  (swap! (:state a) assoc :model model :effort effort)
+  (if-let [f (:choose-model (:impl a))] (f a model effort) :restart))
+
+(defn reset-conversation!
+  "Forget the conversation: the next start opens a new one."
+  [a]
+  (swap! (:state a) dissoc :session-id))
+
+(defn set-autonomy!
+  "Use autonomy (:auto, :ask or :read-only) from the next start."
+  [a autonomy]
+  (swap! (:state a) assoc :autonomy autonomy))
+
+;;; ------------------------------------------------------------------------------------
+;;; JSON
+
+(defn jget
+  "The value at the path of keys in a JSON object, or nil."
+  [x & ks]
+  (reduce (fn [x k] (when (map? x) (get x k))) x ks))
+
+(defn read-json
+  "line read as JSON, or nil if it isn't."
+  [line]
+  (try (json/read-str line) (catch error e nil)))
+
+(defn truncate
+  "s cut to n characters, with … if it was longer."
+  [s n]
+  (let [s (str (or s ""))]
+    (if (> (count s) n) (str (subs s 0 (dec n)) "…") s)))
+
+(defn question-options
+  "A question's options, from the CLI's JSON: [{:label :description}]."
+  [os]
+  (mapv (fn [o] {:label (get o "label") :description (get o "description")}) os))
+
+;;; ------------------------------------------------------------------------------------
+;;; The CLI: a program whose stdin and stdout carry lines of JSON
+
+(defn start-cli!
+  "Run cmd (a vector) in dir: on-line is called with each line it writes, on-exit with
+its exit status and its error output once it ends, each on a fiber of its own, and
+on-error with the message of an error on-line signals. Lines written with send-line! go
+out one at a time from another fiber. Returns the CLI."
+  [cmd dir on-line on-exit on-error]
+  (let [p (process/process cmd (cond-> {} dir (assoc :dir dir)))
+        outbox (chan 256)
+        err (future (try (io/read-text (:err p)) (catch error e "")))]
+    (future
+      (loop []
+        (when-let [line (<! outbox)]
+          (when (try (io/write (:in p) (str line "\n"))
+                     (io/flush (:in p))
+                     true
+                     (catch error e false))
+            (recur))))
+      (try (close (:in p)) (catch error e nil)))
+    (future
+      (try
+        (doseq [line (io/line-seq (:out p))]
+          (try (on-line line)
+               (catch error e (on-error (or (ex-message e) (str e))))))
+        (catch error e nil))
+      (close! outbox)
+      (on-exit (:exit @p) @err))
+    {:process p :outbox outbox}))
+
+(defn send-line!
+  "Write a line to the CLI's stdin, or nothing if it has ended."
+  [cli line]
+  (when cli (>! (:outbox cli) line)))
+
+(defn send-json!
+  "Write x as a line of JSON to the CLI."
+  [cli x]
+  (send-line! cli (json/write-str x)))
+
+(defn cli-alive?
+  "True while the CLI runs."
+  [cli]
+  (and cli (process/alive? (:process cli))))
+
+(defn stop-cli!
+  "End the CLI: its stdin is closed, which ends it, and if it still runs a second later,
+it and what it started are stopped (on a fiber: this returns at once)."
+  [cli]
+  (when cli
+    (close! (:outbox cli))
+    (future
+      (when (nil? (deref (:process cli) 1.0 nil))
+        (process/destroy-tree! (:process cli))))
+    nil))
+
+;;; ------------------------------------------------------------------------------------
+;;; Finding the CLIs
+
+(defn- codex-app-bundle []
+  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+
+(defn find-cli
+  "The path of provider's CLI (claude or codex) on the PATH, where its installer puts it,
+or (Codex on macOS) in the ChatGPT app; or nil."
+  [provider]
+  (let [cli-name (name provider)
+        windows (= :windows (system/os))
+        suffixes (if windows [".exe" ".cmd" ""] [""])
+        dirs (remove string/blank?
+                     (string/split (or (system/getenv "PATH") "") (if windows ";" ":")))
+        candidates (concat (for [d dirs s suffixes] (io/path d (str cli-name s)))
+                           (for [s suffixes] (io/path (system/home-dir) ".local" "bin"
+                                                      (str cli-name s)))
+                           (when (and (= provider :codex) (= :macos (system/os)))
+                             [(codex-app-bundle)]))]
+    (first (filter io/file? candidates))))
+
+(defn cli-command
+  "The adapter's CLI as a command with args after it: its :program (a path, or a program
+and its first arguments), else the provider's CLI. Signals an error if there is none."
+  [a args]
+  (let [program (or (:program a)
+                    (find-cli (:provider a))
+                    (error (str "The " (name (:provider a)) " CLI is not installed. Install it "
+                                "and sign in, then try again.")))]
+    (into (if (string? program) [program] (vec program)) args)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Images
+
+(def image-types
+  "File extensions of the images the agents take, and their media types."
+  {"png" "image/png" "jpg" "image/jpeg" "jpeg" "image/jpeg" "gif" "image/gif"
+   "webp" "image/webp"})
+
+(def image-size-limit
+  "The largest image sent; larger ones are left out."
+  (* 3 1024 1024))
+
+(defn image-media-type
+  "The media type of the image file at path, by its extension, or nil."
+  [path]
+  (let [ext (second (re-find #"\.([^./\\]+)$" (str path)))]
+    (when ext (get image-types (string/lower-case ext)))))
+
+(defn sendable-images
+  "The paths that are images no bigger than image-size-limit."
+  [paths]
+  (filterv (fn [path] (and (image-media-type path) (io/file? path)
+                           (<= (count (io/read-bytes path)) image-size-limit)))
+           paths))
+
+(defn image-base64
+  "The image file at path, in base64."
+  [path]
+  (bytes/base64 (io/read-bytes path)))
+
+;;; ------------------------------------------------------------------------------------
+;;; The IDE's tools
+
+(defn tool-schema
+  "A JSON Schema of a tool's input: an object of properties ({name schema}) with the
+required ones (names)."
+  [properties required]
+  {"type" "object" "properties" properties "required" (vec required)})
+
+(defn tools-version
+  "A short fingerprint of a set of tools, to tell when a conversation predates them."
+  [tools]
+  (subs (bytes/hex (bytes/sha256 (json/write-str (mapv (juxt :name :description :schema)
+                                                       tools))))
+        0 12))
+
+;;; ------------------------------------------------------------------------------------
+;;; Usage limits: both CLIs report rolling windows (5 hours, a week). Each is {:id :label
+;;; :remaining (percent left, or nil) :state :reset (seconds since 1970)}.
+
+(defn- window-label [minutes fallback]
+  (cond (not (number? minutes)) fallback
+        (zero? (mod minutes 1440)) (str (quot minutes 1440) "d")
+        (zero? (mod minutes 60)) (str (quot minutes 60) "h")
+        :else (str minutes "m")))
+
+(defn- percent [x] (max 0 (min 100 (int (math/round x)))))
+
+(defn codex-limit-windows
+  "Codex's windows, from account/rateLimits/read or account/rateLimits/updated."
+  [result]
+  (let [by-id (sort-by key (jget result "rateLimitsByLimitId"))
+        single (jget result "rateLimits")
+        buckets (if (seq by-id)
+                  by-id
+                  (when (map? single) [[(or (get single "limitId") "codex") single]]))]
+    (vec (for [[id bucket] buckets
+               kind ["primary" "secondary"]
+               :let [window (get bucket kind)
+                     used (jget window "usedPercent")]
+               :when (number? used)]
+           {:id (str id "/" kind)
+            :label (str (when (> (count buckets) 1) (str (or (get bucket "limitName") id) " "))
+                        (window-label (jget window "windowDurationMins") kind))
+            :remaining (percent (- 100 used))
+            :reset (jget window "resetsAt")}))))
+
+(defn claude-limit-windows
+  "Claude's windows, from a rate_limit_event's rate_limit_info."
+  [info]
+  (let [unified (sort-by key (jget info "unifiedWindows"))
+        windows (if (seq unified) unified [[(or (get info "rateLimitType") "session") info]])]
+    (vec (for [[id window] windows
+               :let [used (get window "utilization")
+                     reset (get window "resetsAt")]]
+           {:id id
+            :label (case id
+                     "five_hour" "5h"
+                     "seven_day" "7d"
+                     "seven_day_opus" "7d Opus"
+                     (string/replace id "_" " "))
+            :remaining (when (number? used) (percent (* 100 (- 1 used))))
+            :state (get window "status")
+            :reset (when (number? reset) reset)}))))
+
+(defn merge-limit-windows
+  "new's windows in place of old's with the same ids."
+  [old new]
+  (let [ids (set (map :id new))]
+    (into (vec (remove (fn [w] (contains? ids (:id w))) old)) new)))
+
+(defn limit-exhausted?
+  "True if the window is used up."
+  [window]
+  (or (= "rejected" (:state window))
+      (and (number? (:remaining window)) (<= (:remaining window) 0))))

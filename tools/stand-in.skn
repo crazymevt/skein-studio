@@ -1,0 +1,58 @@
+(ns stand-in
+  "A stand-in for the agents' CLIs (Skein's M3.8, D-110): it speaks Claude Code's
+stream-json or Codex's app-server JSON-RPC from a script, so Skein Studio's adapters and
+its scripted session run without the real CLIs or an account.
+
+    stand-in <script.edn> [the CLI's arguments...]
+
+The script is a vector of steps, run in order:
+  [:expect match]  read lines until one is JSON that match matches: a map of paths, keys
+                   joined by dots (\"request.subtype\"), to values; it is then the last
+                   message
+  [:send x]        write x as a line of JSON, its strings \"$last.path\" replaced by the
+                   value at path in the last message, and \"$args\" by the arguments
+  [:sleep secs]    wait
+  [:exit status]   end now
+At the end of the script it reads until its input ends, then exits with 0. If its input
+ends during an :expect, it says on stderr what it waited for and exits with 1."
+  (:require [skein.io :as io]
+            [skein.edn :as edn]
+            [skein.json :as json]
+            [skein.string :as string]))
+
+(defn- at-path [x path]
+  (reduce (fn [x k] (when (map? x) (get x k))) x (string/split path #"\.")))
+
+(defn- matches? [match x]
+  (every? (fn [[path v]] (= v (at-path x path))) match))
+
+(defn- fill
+  "x with its \"$last.path\" strings replaced from the last message, \"$args\" by args."
+  [x last args]
+  (cond (= x "$args") args
+        (and (string? x) (string/starts-with? x "$last.")) (at-path last (subs x 6))
+        (map? x) (into {} (map (fn [[k v]] [k (fill v last args)]) x))
+        (vector? x) (mapv (fn [v] (fill v last args)) x)
+        :else x))
+
+(defn -main [script-path & args]
+  (let [steps (edn/read-string (io/read-file script-path))
+        args (vec args)]
+    (loop [steps steps last nil]
+      (if-let [[kind x] (first steps)]
+        (case kind
+          :expect (let [m (loop []
+                            (if-let [line (io/read-line io/stdin)]
+                              (let [v (try (json/read-str line) (catch error e nil))]
+                                (if (and v (matches? x v)) v (recur)))
+                              nil))]
+                    (if m
+                      (recur (rest steps) m)
+                      (do (eprintln "stand-in: the input ended while expecting" (pr-str x))
+                          (%exit 1))))
+          :send (do (println (json/write-str (fill x last args)))
+                    (recur (rest steps) last))
+          :sleep (do (sleep x) (recur (rest steps) last))
+          :exit (%exit x))
+        (do (loop [] (when (io/read-line io/stdin) (recur)))
+            (%exit 0))))))
