@@ -17,7 +17,12 @@ can't be read leaves the defaults."
    :line-numbers true
    :wrap false
    :restore-session true
-   :ignored-names #{".DS_Store" ".skein-cache"}})
+   :ignored-names #{".DS_Store" ".skein-cache"}
+   ;; the agent panel (Skein's M3.8, D-110): the agent shown, :auto, :ask or :read-only,
+   ;; and each agent's {:model :effort}, nil for the CLI's own choice
+   :agent "claude"
+   :agent-autonomy :auto
+   :agent-choices {}})
 
 (def ^:dynamic *config-dir*
   "Where settings and the session are kept: Skein Studio's config directory, or another

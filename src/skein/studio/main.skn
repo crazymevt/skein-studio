@@ -11,6 +11,7 @@ settings of its own, and exits with status 1 if a step fails."
             [skein.studio.settings :as settings]
             [skein.studio.documents :as docs]
             [skein.studio.workbench :as workbench]
+            [skein.studio.agents.panel :as agent-panel]
             [skein.studio.script :as script]))
 
 (defn- backend [args]
@@ -55,6 +56,7 @@ step passed."
     (binding [settings/*config-dir* (io/temp-dir "studio-script")]
       (settings/load-settings!)
       (let [wb (workbench/make-workbench)]
+        (agent-panel/install! wb)
         (ui/on (:window wb) :closed (fn [_] (ui/quit!)))
         (if (run-script wb file)
           (println "; the scripted session passed")
@@ -63,6 +65,7 @@ step passed."
         (let [folder (first (remove (fn [a] (string? (re-find #"^--" a))) args))
               saved (settings/load-session)
               wb (workbench/make-workbench {:size (:size saved)})]
+          (agent-panel/install! wb)
           (cond folder (workbench/open-folder! wb folder)
                 (and saved (settings/setting :restore-session))
                 (workbench/restore-session! wb saved))

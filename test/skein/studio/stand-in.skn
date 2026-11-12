@@ -1,0 +1,19 @@
+(ns skein.studio.stand-in
+  "For the agents' tests: tools/stand-in.skn, a stand-in for Claude Code's and Codex's
+CLIs (Skein's M3.8, D-110), built once."
+  (:require [skein.io :as io]
+            [skein.studio.inferior :as inferior]))
+
+(def program
+  "The stand-in's path, built when first used."
+  (delay (let [out (io/path (io/temp-dir "stand-in") "stand-in")
+               r (io/run-process [(io/path (inferior/skein-home) "build/skeinc") "build"
+                                  (io/absolute-path "tools/stand-in.skn") "-o" out])]
+           (when-not (zero? (:exit r))
+             (error (str "building the stand-in failed: " (:err r) (:out r))))
+           out)))
+
+(defn command
+  "The stand-in playing the script at path: a program for an adapter's :program."
+  [script]
+  [@program (io/absolute-path script)])

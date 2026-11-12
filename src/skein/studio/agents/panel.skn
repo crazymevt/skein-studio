@@ -1,0 +1,564 @@
+(ns skein.studio.agents.panel
+  "The agent panel (Skein's M3.8 step 4, D-110), Lisp Studio's on skein-ui: Claude Code
+and Codex at its top with their model, effort and autonomy; the chat in rich text, replies
+streaming in as Markdown, with the agents' tool activity; approvals and questions as
+buttons; the account's usage limits; and the composer, which sends the message (with the
+open file and the selection as context, and attached files) or, while a turn runs, adds it
+to the turn. It sits on the right of the editors (View ▸ Agent, Primary+J); install!
+puts it in a workbench.
+
+The adapters' events come on their fibers and are handed to the UI's thread, where
+everything here runs."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.system :as system]
+            [skein.markdown :as md]
+            [skein.studio.settings :as settings]
+            [skein.studio.workbench :as wb]
+            [skein.studio.agents :as agents]
+            [skein.studio.agents.claude :as claude]
+            [skein.studio.agents.codex :as codex]
+            [skein.studio.agents.tools :as tools]))
+
+(def agent-ids "The agents, in the order they're offered." ["claude" "codex"])
+
+(defn- agent-index [id] (or (first (keep-indexed (fn [i x] (when (= x id) i)) agent-ids)) 0))
+
+(defn agent-label [id] (if (= id "codex") "Codex" "Claude"))
+
+(def ^:private autonomies [[:auto "Auto"] [:ask "Ask first"] [:read-only "Read only"]])
+
+;;; The composer: Return sends, Shift+Return starts a new line.
+
+(defclass composer-view [ui/code-view-widget]
+  "The message being written: Return sends it (on-send), Shift+Return starts a new line."
+  (on-send :cell :atom :init nil))
+
+(defmethod ui/measure [(v composer-view)]
+  ;; a code view measures 200 tall; the composer is a few lines, the chat gets the rest
+  [300 72])
+
+(defmethod ui/handle-event :around [(v composer-view) (e ui/key-event)]
+  (if (and (= :key-down (:signal e)) (not (ui/consumed? e)) (= :return (:key e))
+           (empty? (:modifiers e)) (:on-send v))
+    (do ((:on-send v)) (ui/consume! e))
+    (call-next-method)))
+
+;;; State
+
+(defn- st [p] @(:state p))
+
+(defn- choice
+  "The model or effort (k) chosen for agent id, or nil for the CLI's own."
+  [id k]
+  (get-in (settings/setting :agent-choices) [id k]))
+
+(defn- set-choice! [id k v]
+  (settings/set-setting! :agent-choices
+                         (assoc-in (settings/setting :agent-choices) [id k]
+                                   (when-not (string/blank? (str v)) v))))
+
+(defn- session-key [p] (or (wb/folder (:w p)) "~"))
+
+(defn- saved-session
+  "The conversation agent id last had in this folder, to resume."
+  [p id]
+  (get-in (settings/setting :agent-sessions) [(session-key p) id]))
+
+(defn- save-session-id! [p id session]
+  (settings/set-setting! :agent-sessions
+                         (assoc-in (or (settings/setting :agent-sessions) {})
+                                   [(session-key p) id] session)))
+
+;;; The chat: entries rendered as rich text.
+
+(defn- user-blocks [{:keys [text context files]}]
+  (concat [[:p [:b "You"]]]
+          (map (fn [para] [:p para]) (remove string/blank? (string/split text #"\n\s*\n")))
+          (when (or (seq context) (seq files))
+            [[:p [:i (string/join ", " (concat context (map io/file-name files)))]]])))
+
+(defn- activity-blocks [{:keys [label detail output state]}]
+  (let [mark (case state :done " ✓" :failed " ✗" " …")]
+    (concat [[:p "▸ " [:b (str label)] (when (seq detail) " ") (when (seq detail) [:code detail])
+              mark]]
+            (when (and (= state :failed) (seq output))
+              [[:pre (string/join "\n" (take 10 (string/split-lines output)))]]))))
+
+(defn entry-blocks
+  "The Hiccup blocks of a chat entry."
+  [e]
+  (case (:kind e)
+    :user (user-blocks e)
+    :agent [[:p [:b (agent-label (:agent e))]]]
+    :reply (md/parse (:text e) {:softbreak " "})
+    :activity (activity-blocks e)
+    :notice [[:p [:i (str (when (:error e) "⚠ ") (:text e))]]]
+    []))
+
+(defn- render! [p]
+  (swap! (:state p) assoc :render-pending false)
+  (let [entries (mapv (fn [e] (if (contains? e :blocks) e (assoc e :blocks (entry-blocks e))))
+                      (:entries (st p)))]
+    (swap! (:state p) assoc :entries entries)
+    (set-slot! (:chat p) :content (vec (mapcat :blocks entries)))
+    (ui/scroll-to-position! (:chat p) (ui/text-length (:chat p)))))
+
+(defn- schedule-render!
+  "Render the chat soon: deltas that come close together are rendered once."
+  [p]
+  (when-not (:render-pending (st p))
+    (swap! (:state p) assoc :render-pending true)
+    (ui/after 0.05 (fn [] (render! p)))))
+
+(defn- add-entry! [p e]
+  (swap! (:state p) update :entries conj e)
+  (schedule-render! p))
+
+(defn- update-entry!
+  "Change the entry of kind with :item item by f, adding (f nil) if there is none."
+  [p kind item f]
+  (swap! (:state p) update :entries
+         (fn [es]
+           (if-let [i (first (keep-indexed (fn [i e] (when (and (= kind (:kind e))
+                                                                (= item (:item e)))
+                                                       i))
+                                           es))]
+             (assoc es i (dissoc (f (nth es i)) :blocks))
+             (conj es (f nil)))))
+  (schedule-render! p))
+
+(defn notice!
+  "Show a line in the chat; error marks it as one."
+  ([p text] (notice! p text false))
+  ([p text error] (add-entry! p {:kind :notice :text text :error error})))
+
+(defn chat-text
+  "The chat's text, as it shows."
+  [p]
+  (ui/code-text (:chat p)))
+
+;;; The header
+
+(defn- active [p] (:active (st p)))
+
+(defn- refresh-header! [p]
+  (let [{:keys [status models limits]} (st p)
+        id (active p)
+        ms (get models id)
+        model (choice id :model)
+        efforts (or (:efforts (first (filter (fn [m] (= model (:id m))) ms)))
+                    (some :efforts (filter :default ms))
+                    [])
+        windows (get limits id)]
+    (set-slot! (:status-label p) :text (name (or (get status id) :stopped)))
+    (set-slot! (:model-box p) :items (into ["Default model"] (map :label ms)))
+    (set-slot! (:model-box p) :selected-index
+               (or (first (keep-indexed (fn [i m] (when (= model (:id m)) (inc i))) ms)) 0))
+    (set-slot! (:effort-box p) :items (into ["Default effort"] efforts))
+    (set-slot! (:effort-box p) :selected-index
+               (or (first (keep-indexed (fn [i e] (when (= (choice id :effort) e) (inc i)))
+                                        efforts))
+                   0))
+    (set-slot! (:limits-label p) :text
+               (string/join " · " (map (fn [w] (str (:label w) " "
+                                                    (if (:remaining w) (str (:remaining w) "% left")
+                                                        (or (:state w) ""))))
+                                       windows)))
+    (set-slot! (:stop-button p) :enabled (= :busy (get status id)))))
+
+;;; Requests: approvals and questions, as buttons under the chat
+
+(defn- adapter-of [p id] (get-in (st p) [:adapters id]))
+
+(defn- answer! [p id request decision answers]
+  (when-let [a (adapter-of p id)]
+    (agents/answer! a (:id request) decision answers)))
+
+(defn- question-widget [p id request q answers]
+  (let [qid (:id q)]
+    (if (:multiple q)
+      (apply ui/vbox {:spacing 2}
+             (ui/label {:text (str (:text q))})
+             (for [o (:options q)]
+               (ui/check-box {:label (:label o) :tooltip (:description o)
+                              :on-toggled (fn [e] (swap! answers update qid
+                                                         (fn [xs] (if (:value e)
+                                                                    (conj (vec xs) (:label o))
+                                                                    (vec (remove #{(:label o)}
+                                                                                 xs))))))})))
+      (apply ui/vbox {:spacing 2}
+             (ui/label {:text (str (:text q))})
+             [(apply ui/hbox {:spacing 4}
+                     (for [o (:options q)]
+                       (ui/button {:label (:label o) :tooltip (:description o)
+                                   :on-clicked (fn [_]
+                                                 (swap! answers assoc qid (:label o)))})))]))))
+
+(defn- request-widget [p id request]
+  (let [answers (atom {})]
+    (case (:kind request)
+      :question
+      (apply ui/vbox {:padding 6 :spacing 6 :surface :status}
+             (ui/label {:text (str (agent-label id) ": " (:title request))})
+             (concat (for [q (:questions request)] (question-widget p id request q answers))
+                     [(ui/button {:label "Answer"
+                                  :on-clicked (fn [_] (answer! p id request :allow @answers))})]))
+      (ui/vbox {:padding 6 :spacing 6 :surface :status}
+        (ui/label {:text (str (agent-label id) ": " (:title request))})
+        (ui/label {:text (str (:detail request)) :wrap true})
+        (apply ui/hbox {:spacing 6}
+               (for [o (:options request)]
+                 (ui/button {:label (:label o)
+                             :on-clicked (fn [_] (answer! p id request (:value o) nil))})))))))
+
+(defn- refresh-requests! [p]
+  (let [rs (:requests (st p))
+        box (:requests-box p)]
+    (doseq [c (:children box)]
+      (ui/remove! box c)
+      (ui/destroy! c))
+    (doseq [[_ [id r]] (sort-by key rs)]
+      (ui/add! box (request-widget p id r)))
+    (set-slot! box :visible (boolean (seq rs)))))
+
+(defn open-requests
+  "The requests waiting for an answer, [agent-id request]."
+  [p]
+  (vec (vals (:requests (st p)))))
+
+;;; Events
+
+(defn- exited! [p id e]
+  (let [a (adapter-of p id)]
+    ;; A restart (another model) ends the old CLI once the new one runs: that one stays.
+    (when-not (and a (agents/cli-alive? (agents/state a :cli)))
+      (swap! (:state p) (fn [s] (-> s
+                                    (update :adapters dissoc id)
+                                    (assoc-in [:status id] :stopped))))
+      (let [err (string/trim (str (:stderr e)))]
+        (when (seq err)
+          (wb/append-output! (:w p) (str (agent-label id) " exited (" (:code e) "):\n" err "\n")))
+        (when (and (not= 0 (:code e)) (seq err))
+          (notice! p (str (agent-label id) " stopped: "
+                          (agents/truncate (last (string/split-lines err)) 200))
+                   true)))
+      (refresh-header! p))))
+
+(defn on-event!
+  "Handle an adapter's event, on the UI's thread."
+  [p e]
+  (let [id (:agent e)]
+    (case (:type e)
+      :status (do (swap! (:state p) assoc-in [:status id] (:status e))
+                  (when (:message e) (notice! p (str (:message e)) true))
+                  (refresh-header! p))
+      :text (update-entry! p :reply (:item e)
+                           (fn [x] (if x
+                                     (update x :text str (:delta e))
+                                     {:kind :reply :item (:item e) :agent id :text (:delta e)})))
+      :message (update-entry! p :reply (:item e)
+                              (fn [x] (assoc (or x {:kind :reply :item (:item e) :agent id})
+                                             :text (:text e))))
+      :activity (let [given (into {} (remove (fn [[_ v]] (nil? v))
+                                             (select-keys e [:label :detail :output :state])))]
+                  (update-entry! p :activity (:item e)
+                                 (fn [x] (merge (or x {:kind :activity :item (:item e)}) given))))
+      :request (let [r (:request e)]
+                 (swap! (:state p) assoc-in [:requests (:id r)] [id r])
+                 (refresh-requests! p)
+                 (wb/show-right! (:w p))
+                 (wb/message! (:w p) (str (agent-label id) " is waiting for your answer.")))
+      :request-resolved (do (swap! (:state p) update :requests dissoc (:id e))
+                            (refresh-requests! p)
+                            (when (empty? (:requests (st p))) (wb/message! (:w p) "")))
+      :tool-call (tools/run-tool! (:w p) e)
+      :turn-done (when (:error e) (notice! p (str (:error e)) true))
+      :models (do (swap! (:state p) assoc-in [:models id] (:models e))
+                  (refresh-header! p))
+      :limits (do (swap! (:state p) assoc-in [:limits id] (:windows e))
+                  (refresh-header! p))
+      :usage (swap! (:state p) assoc-in [:usage id] (select-keys e [:context-used :context-window]))
+      :session (save-session-id! p id (:id e))
+      :reset (save-session-id! p id nil)
+      :notice (notice! p (str (:text e)))
+      :exited (exited! p id e)
+      nil)))
+
+;;; Agents
+
+(defn- ensure-agent!
+  "Agent id's adapter, started now if it wasn't; nil if its CLI isn't installed."
+  [p id]
+  (or (adapter-of p id)
+      (let [program (get (:programs p) id)
+            provider (keyword id)]
+        (if-not (or program (agents/find-cli provider))
+          (do (notice! p (str "The " id " CLI isn't installed: install it and sign in, then "
+                              "try again.")
+                       true)
+              nil)
+          (let [make (if (= id "codex") codex/adapter claude/adapter)
+                a (make {:name id :folder (or (wb/folder (:w p)) (system/home-dir))
+                         :program program :tools tools/tools :instructions tools/instructions
+                         :autonomy (settings/setting :agent-autonomy)
+                         :model (choice id :model) :effort (choice id :effort)
+                         :session-id (saved-session p id)
+                         :session-tools (when (saved-session p id)
+                                          (agents/tools-version tools/tools))
+                         :sink (fn [e] (ui/after 0 (fn [] (on-event! p e))))})]
+            (swap! (:state p) assoc-in [:adapters id] a)
+            (try (agents/start! a) a
+                 (catch error e
+                   (swap! (:state p) update :adapters dissoc id)
+                   (notice! p (str "Couldn't start " (agent-label id) ": "
+                                   (or (ex-message e) e))
+                            true)
+                   nil)))))))
+
+(defn- restart-agent! [p id]
+  (when-let [a (adapter-of p id)]
+    (agents/stop! a)
+    (agents/start! a)))
+
+(defn select-agent!
+  "Show agent id (\"claude\" or \"codex\") and start it."
+  [p id]
+  (swap! (:state p) assoc :active id)
+  (settings/set-setting! :agent id)
+  (set-slot! (:agent-box p) :selected-index (agent-index id))
+  (refresh-header! p)
+  (ensure-agent! p id))
+
+(defn- model-chosen! [p i]
+  (let [id (active p)
+        ms (get-in (st p) [:models id])
+        model (when (pos? i) (:id (nth ms (dec i) nil)))]
+    (when (not= model (choice id :model))
+      (set-choice! id :model model)
+      (set-choice! id :effort nil)
+      (refresh-header! p)
+      (when-let [a (adapter-of p id)]
+        (when (= :restart (agents/choose-model! a model nil))
+          (restart-agent! p id)
+          (notice! p (str (agent-label id) " restarted with "
+                          (or (:label (first (filter (fn [m] (= model (:id m))) ms)))
+                              "its default model")
+                          "; the conversation goes on.")))))))
+
+(defn- effort-chosen! [p i]
+  (let [id (active p)
+        effort (when (pos? i) (nth (:items (:effort-box p)) i nil))]
+    (when (not= effort (choice id :effort))
+      (set-choice! id :effort effort)
+      (when-let [a (adapter-of p id)]
+        (when (= :restart (agents/choose-model! a (choice id :model) effort))
+          (restart-agent! p id))))))
+
+(defn set-autonomy!
+  "Use autonomy (:auto, :ask or :read-only) from each agent's next start."
+  [p autonomy]
+  (settings/set-setting! :agent-autonomy autonomy)
+  (doseq [[_ a] (:adapters (st p))] (agents/set-autonomy! a autonomy))
+  (notice! p (str (second (first (filter (fn [[k _]] (= k autonomy)) autonomies)))
+                  " from the next start of a conversation.")))
+
+(defn new-chat!
+  "Stop the agents and forget their conversations: the next message starts a new one."
+  [p]
+  (doseq [[id a] (:adapters (st p))]
+    (agents/stop! a)
+    (agents/reset-conversation! a)
+    (save-session-id! p id nil))
+  (swap! (:state p) assoc :adapters {} :status {} :entries [] :requests {})
+  (refresh-requests! p)
+  (refresh-header! p)
+  (render! p))
+
+;;; Sending
+
+(defn context
+  "What the message says of where the user is, and its labels for the chat:
+[text labels], text nil when there is nothing to say."
+  [p include-file include-selection]
+  (let [w (:w p)]
+    (if-let [ed (wb/active-editor w)]
+      (let [v (:view ed)
+            path (:path (:document ed))
+            rel (let [f (wb/folder w)]
+                  (if (and f (string/starts-with? path (str f "/")))
+                    (subs path (inc (count f)))
+                    path))
+            line (inc (ui/position-line (:buffer v) (:cursor v)))
+            selected (ui/selected-text v)
+            parts (concat
+                   (when include-file
+                     [(str "The user is looking at " rel ", line " line
+                           (when-let [ns (wb/file-ns ed)] (str ", in namespace " ns)) ".")])
+                   (when (and include-selection (seq selected))
+                     [(str "Selected text:\n```\n" (agents/truncate selected 12000) "\n```")]))
+            labels (concat (when include-file [rel])
+                           (when (and include-selection (seq selected))
+                             [(str (count selected) " characters selected")]))]
+        [(when (seq parts) (string/join "\n\n" parts)) (vec labels)])
+      [nil []])))
+
+(defn- attachments-text [files images]
+  (str "The user attached " (if (next files) "these files" "this file") ":\n"
+       (string/join "\n" (for [f files]
+                           (str "- " f
+                                (cond (some #{f} images) " (an image, included in this message)"
+                                      (agents/image-media-type f)
+                                      " (an image too large to include: open it with your tools)"
+                                      :else ""))))))
+
+(defn send!
+  "Send text (by default the composer's) to the agent shown: as a new turn, or added to
+the turn under way."
+  ([p] (send! p (ui/code-text (:composer p))))
+  ([p text]
+   (let [files (:attachments (st p))]
+     (when (or (not (string/blank? text)) (seq files))
+       (let [id (active p)]
+         (when-let [a (ensure-agent! p id)]
+           (let [[ctx labels] (context p (:checked (:file-box p)) (:checked (:selection-box p)))
+                 images (agents/sendable-images files)
+                 message (str (if (and (string/blank? text) (seq files))
+                                "See the attached files."
+                                text)
+                              (when (seq files) (str "\n\n" (attachments-text files images)))
+                              (when ctx (str "\n\n---\n" ctx)))]
+             (add-entry! p {:kind :user :text text :context labels :files files})
+             (add-entry! p {:kind :agent :agent id})
+             (swap! (:state p) assoc :attachments [])
+             (set-slot! (:attachments-label p) :text "")
+             (ui/set-buffer-text! (:buffer (:composer p)) "")
+             (if (= :busy (get-in (st p) [:status id]))
+               (agents/steer! a message images)
+               (agents/send! a message images)))))))))
+
+(defn attach!
+  "Attach files (paths) to the next message."
+  [p files]
+  (swap! (:state p) update :attachments (fn [xs] (vec (distinct (concat xs files)))))
+  (set-slot! (:attachments-label p) :text
+             (string/join ", " (map io/file-name (:attachments (st p))))))
+
+(defn stop!
+  "Stop the turn under way."
+  [p]
+  (when-let [a (adapter-of p (active p))] (agents/interrupt! a)))
+
+(defn stop-agents!
+  "End every agent's CLI."
+  [p]
+  (doseq [[_ a] (:adapters (st p))] (agents/stop! a)))
+
+;;; The panel
+
+(defn- link-activated! [p href]
+  (let [w (:w p)
+        path (when-not (re-find #"^[a-z][a-z0-9+.-]*:" href)
+               (if (or (io/absolute? href) (nil? (wb/folder w)))
+                 href
+                 (io/path (wb/folder w) href)))]
+    (if (and path (io/file? path))
+      (wb/open-file! w path)
+      (system/open! href))))
+
+(defn make-panel
+  "The agent panel of the workbench w. opts: :programs, {agent-id program}, for CLIs other
+than the installed ones (tests give stand-ins)."
+  ([w] (make-panel w {}))
+  ([w opts]
+   (let [p-ref (atom nil)
+         later (fn [f] (fn [e] (when-let [p @p-ref] (f p e))))
+         agent-box (ui/combo-box {:items (mapv agent-label agent-ids)
+                                  :on-changed (later (fn [p e]
+                                                       (when-let [i (:index e)]
+                                                         (select-agent! p (nth agent-ids i)))))})
+         status-label (ui/label {:text "stopped"})
+         new-chat (ui/button {:label "New Chat" :on-clicked (later (fn [p _] (new-chat! p)))})
+         model-box (ui/combo-box {:items ["Default model"] :selected-index 0
+                                  :on-changed (later (fn [p e] (when-let [i (:index e)]
+                                                                 (model-chosen! p i))))})
+         effort-box (ui/combo-box {:items ["Default effort"] :selected-index 0
+                                   :on-changed (later (fn [p e] (when-let [i (:index e)]
+                                                                  (effort-chosen! p i))))})
+         autonomy-box (ui/combo-box
+                       {:items (mapv second autonomies)
+                        :selected-index (or (first (keep-indexed
+                                                    (fn [i [k _]]
+                                                      (when (= k (settings/setting :agent-autonomy))
+                                                        i))
+                                                    autonomies))
+                                            0)
+                        :on-changed (later (fn [p e]
+                                             (when-let [i (:index e)]
+                                               (set-autonomy! p (first (nth autonomies i))))))})
+         limits-label (ui/label {:text ""})
+         chat (ui/rich-text {:vexpand true
+                             :on-link-activated (later (fn [p e] (link-activated! p (:href e))))})
+         requests-box (ui/vbox {:spacing 6 :visible false})
+         file-box (ui/check-box {:label "Open file" :checked true})
+         selection-box (ui/check-box {:label "Selection" :checked true})
+         attachments-label (ui/label {:text ""})
+         choose (fn [p _]
+                  (when-let [fs (ui/choose-file {:title "Attach Files" :multiple true
+                                                 :parent (:window w) :directory (wb/folder w)})]
+                    (attach! p (if (string? fs) [fs] fs))))
+         attach (ui/button {:label "Attach…" :on-clicked (later choose)})
+         composer (ui/build composer-view {:vexpand false :wrap true :line-numbers false
+                                           :placeholder "Ask the agent… (Return sends)"}
+                            nil)
+         send-button (ui/button {:label "Send" :on-clicked (later (fn [p _] (send! p)))})
+         stop-button (ui/button {:label "Stop" :enabled false
+                                 :on-clicked (later (fn [p _] (stop! p)))})
+         widget (ui/vbox {:padding 8 :spacing 6 :vexpand true}
+                  (ui/hbox {:spacing 6} agent-box status-label (ui/box {:hexpand true}) new-chat)
+                  (ui/hbox {:spacing 6} model-box effort-box autonomy-box)
+                  limits-label
+                  chat
+                  requests-box
+                  (ui/hbox {:spacing 8} file-box selection-box attach attachments-label)
+                  composer
+                  (ui/hbox {:spacing 6} (ui/box {:hexpand true}) stop-button send-button))
+         id (let [s (settings/setting :agent)] (if (some #{s} agent-ids) s "claude"))
+         p {:w w :widget widget :chat chat :composer composer :agent-box agent-box
+            :status-label status-label :model-box model-box :effort-box effort-box
+            :autonomy-box autonomy-box :limits-label limits-label :requests-box requests-box
+            :file-box file-box :selection-box selection-box :attachments-label attachments-label
+            :send-button send-button :stop-button stop-button :programs (:programs opts)
+            :state (atom {:active id :adapters {} :status {} :models {} :limits {} :usage {}
+                          :entries [] :requests {} :attachments []})}]
+     (reset! p-ref p)
+     (set-slot! composer :on-send (fn [] (send! p)))
+     (set-slot! agent-box :selected-index (agent-index id))
+     (refresh-header! p)
+     p)))
+
+(defn toggle!
+  "Show the agent panel, starting its agent, or hide it."
+  [p]
+  (let [w (:w p)
+        shown (not (wb/right-shown? w))]
+    (wb/show-right! w shown)
+    (when shown
+      (ensure-agent! p (active p))
+      (ui/focus! (:composer p)))))
+
+(defn install!
+  "Make the agent panel of the workbench w, put it on the right of the editors and give
+the workbench its commands. Returns the panel."
+  ([w] (install! w {}))
+  ([w opts]
+   (let [p (make-panel w opts)]
+     (wb/set-right-panel! w (:widget p))
+     (wb/add-commands! w [{:menu "View" :separator true}
+                          {:menu "View" :title "Agent" :shortcut "Primary+J"
+                           :run (fn [] (toggle! p))}
+                          {:menu "View" :title "New Agent Chat" :shortcut nil
+                           :run (fn [] (new-chat! p))}])
+     (ui/on (:window w) :closed (fn [_] (stop-agents! p)))
+     p)))

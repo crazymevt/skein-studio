@@ -1,0 +1,163 @@
+(ns skein.studio.agent-panel-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.studio.settings :as settings]
+            [skein.studio.workbench :as wb]
+            [skein.studio.stand-in :as stand-in]
+            [skein.studio.agents.panel :as panel]))
+
+;; The agent panel (Skein's M3.8 step 4, D-110), on the headless backend, with the
+;; stand-in playing Claude Code through a turn.
+
+(use-fixtures :each
+  (fn [t]
+    (ui/use-backend! (headless/backend))
+    (binding [settings/*config-dir* (io/temp-dir "studio-config")]
+      (settings/load-settings!)
+      (t))))
+
+(defn- wait-for [secs done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n (* secs 10)) (done?)
+          :else (do (headless/advance! 0.1) (sleep 0.1) (recur (inc n))))))
+
+(defn- status [p] (get-in @(:state p) [:status "claude"]))
+
+(defn- buttons
+  "The buttons under w, depth first."
+  [w]
+  (if (instance? ui/button-widget w)
+    [w]
+    (vec (mapcat buttons (or (:children w) [])))))
+
+(deftest entries-as-hiccup
+  (is (= [[:p [:b "You"]] [:p "one"] [:p "two"] [:p [:i "main.skn, a.png"]]]
+         (panel/entry-blocks {:kind :user :text "one\n\ntwo" :context ["main.skn"]
+                              :files ["/tmp/a.png"]})))
+  (is (= [[:h1 "Done"] [:p "with " [:b "it"]]]
+         (panel/entry-blocks {:kind :reply :text "# Done\n\nwith **it**"})))
+  (is (= [[:p "▸ " [:b "Bash"] " " [:code "ls"] " ✓"]]
+         (panel/entry-blocks {:kind :activity :label "Bash" :detail "ls" :state :done})))
+  (is (= [[:p "▸ " [:b "Bash"] " " [:code "ls"] " ✗"] [:pre "no such file"]]
+         (panel/entry-blocks {:kind :activity :label "Bash" :detail "ls" :state :failed
+                              :output "no such file"})))
+  (is (= [[:p [:i "⚠ it broke"]]]
+         (panel/entry-blocks {:kind :notice :text "it broke" :error true}))))
+
+(deftest a-turn-in-the-panel
+  (let [root (io/temp-dir "studio-agent")
+        w (wb/make-workbench)]
+    (settings/set-setting! :agent-autonomy :ask)
+    (ui/show! (:window w))
+    (wb/open-folder! w root)
+    (let [script "test/agents/claude-turn.edn"
+          p (panel/install! w {:programs {"claude" (stand-in/command script)}})]
+      (is (not (wb/right-shown? w)))
+      (is (some (fn [c] (= "Agent" (:title c))) (wb/commands w)) "View ▸ Agent")
+      (testing "showing it starts the agent, whose models it offers"
+        (panel/toggle! p)
+        (is (wb/right-shown? w))
+        (is (wait-for 30 (fn [] (= :idle (status p)))) (panel/chat-text p))
+        (is (= ["Default model" "Opus" "Sonnet"] (:items (:model-box p))))
+        (is (= ["Default effort" "low" "high"] (:items (:effort-box p)))
+            "the default model's (Opus, as the CLI resolves it)")
+        (is (= "idle" (:text (:status-label p)))))
+      (testing "a message, Return sending it"
+        (ui/type-text! (:composer p) "hi")
+        (headless/press-key! (:composer p) "Return")
+        (is (= "" (ui/code-text (:composer p))) "the composer empties")
+        (is (string/includes? (do (wait-for 1 (fn [] false)) (panel/chat-text p)) "You\nhi")))
+      (testing "an approval, as buttons"
+        (is (wait-for 30 (fn [] (seq (panel/open-requests p)))) (panel/chat-text p))
+        (let [[id r] (first (panel/open-requests p))]
+          (is (= ["claude" :approval "Allow Bash?"] [id (:kind r) (:title r)])))
+        (is (:visible (:requests-box p)))
+        (let [allow (first (filter (fn [b] (= "Allow" (:label b))) (buttons (:requests-box p))))]
+          (headless/click! allow))
+        (is (wait-for 10 (fn [] (empty? (panel/open-requests p)))))
+        (is (not (:visible (:requests-box p)))))
+      (testing "the reply, the tool's activity, the IDE's tool answered, the limits"
+        (is (wait-for 30 (fn [] (and (= :idle (status p))
+                                     (string/includes? (panel/chat-text p) "Hello"))))
+            (panel/chat-text p))
+        (wait-for 1 (fn [] false))
+        (let [text (panel/chat-text p)]
+          (is (string/includes? text "Claude\nHello") text)
+          (is (string/includes? text "▸ Bash ls ✓") text))
+        (is (= "5h 75% left" (:text (:limits-label p))))
+        (is (= {:context-used 1200 :context-window 200000}
+               (get-in @(:state p) [:usage "claude"]))))
+      (testing "the conversation is kept, to resume"
+        (is (= "s-1" (get-in (settings/setting :agent-sessions) [(wb/folder w) "claude"]))))
+      (testing "a new chat forgets it"
+        (panel/new-chat! p)
+        (is (= "" (panel/chat-text p)))
+        (is (nil? (get-in (settings/setting :agent-sessions) [(wb/folder w) "claude"]))))
+      (headless/answer! 1 1 1)
+      (ui/close! (:window w)))))
+
+(deftest codex-steered-in-the-panel
+  (let [root (io/temp-dir "studio-agent-codex")
+        w (wb/make-workbench)]
+    (settings/set-setting! :agent-autonomy :ask)
+    (ui/show! (:window w))
+    (wb/open-folder! w root)
+    (let [script "test/agents/codex-turn.edn"
+          p (panel/install! w {:programs {"codex" (stand-in/command script)}})
+          codex-status (fn [] (get-in @(:state p) [:status "codex"]))]
+      (testing "choosing Codex starts it"
+        (panel/select-agent! p "codex")
+        (wb/show-right! w)
+        (is (wait-for 30 (fn [] (= :idle (codex-status)))) (panel/chat-text p))
+        (is (= ["Default model" "GPT-5"] (:items (:model-box p))))
+        (is (= ["Default effort" "low" "high"] (:items (:effort-box p))))
+        (is (= "codex" (settings/setting :agent)) "remembered"))
+      (testing "a message while the turn runs steers it"
+        (panel/send! p "hi")
+        (is (wait-for 30 (fn [] (string/includes? (panel/chat-text p) "Hel")))
+            (panel/chat-text p))
+        (is (= :busy (codex-status)))
+        (panel/send! p "and briefly"))
+      (testing "an approval for the session"
+        (is (wait-for 30 (fn [] (seq (panel/open-requests p)))) (panel/chat-text p))
+        (let [b (first (filter (fn [b] (= "Allow for session" (:label b)))
+                               (buttons (:requests-box p))))]
+          (is b)
+          (headless/click! b)))
+      (testing "the turn completes"
+        (is (wait-for 30 (fn [] (and (= :idle (codex-status))
+                                     (string/includes? (panel/chat-text p) "Command")))))
+        (wait-for 1 (fn [] false))
+        (let [text (panel/chat-text p)]
+          (is (string/includes? text "You\nand briefly") text)
+          (is (string/includes? text "Codex\nHello") text)
+          (is (string/includes? text "▸ Command ls ✓") text)))
+      (headless/answer! 1 1 1)
+      (ui/close! (:window w)))))
+
+(deftest context-for-the-agent
+  (let [root (io/temp-dir "studio-agent-ctx")
+        w (wb/make-workbench)]
+    (io/make-dirs (io/path root "src/app"))
+    (io/write-file (io/path root "src/app/main.skn")
+                   "(ns app.main)\n\n(defn add [a b]\n  (+ a b))\n")
+    (ui/show! (:window w))
+    (wb/open-folder! w root)
+    (let [p (panel/make-panel w)]
+      (is (= [nil []] (panel/context p true true)) "no file open")
+      (wb/open-file! w (io/path (wb/folder w) "src/app/main.skn"))
+      (ui/set-selection! (:view (wb/active-editor w)) 15 30)
+      (let [[text labels] (panel/context p true true)]
+        (is (string/starts-with? text (str "The user is looking at src/app/main.skn, line 3, "
+                                           "in namespace app.main.")))
+        (is (string/includes? text "Selected text:\n```\n(defn add [a b]\n```") text)
+        (is (= ["src/app/main.skn" "15 characters selected"] labels)))
+      (is (= [nil []] (panel/context p false false)))
+      (panel/attach! p ["/tmp/a.png" "/tmp/b.txt"])
+      (is (= "a.png, b.txt" (:text (:attachments-label p)))))
+    (headless/answer! 1 1 1)
+    (ui/close! (:window w))))

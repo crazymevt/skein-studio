@@ -3,7 +3,7 @@
             [skein.io :as io]
             [skein.process :as process]
             [skein.string :as string]
-            [skein.studio.inferior :as inferior]
+            [skein.studio.stand-in :as stand-in]
             [skein.studio.agents :as agents]
             [skein.studio.agents.claude :as claude]
             [skein.studio.agents.codex :as codex]))
@@ -81,15 +81,6 @@
 
 ;;; Through a turn, against the stand-in
 
-(def ^:private stand-in
-  ;; tools/stand-in.skn, built once
-  (delay (let [out (io/path (io/temp-dir "stand-in") "stand-in")
-               r (io/run-process [(io/path (inferior/skein-home) "build/skeinc") "build"
-                                  (io/absolute-path "tools/stand-in.skn") "-o" out])]
-           (when-not (zero? (:exit r))
-             (error (str "building the stand-in failed: " (:err r) (:out r))))
-           out)))
-
 (defn- events-of [events type] (filterv (fn [e] (= type (:type e))) @events))
 
 (defn- wait-for [secs done?]
@@ -104,7 +95,7 @@ handle its requests and tool calls as the IDE would; returns its events."
   [make script on-text]
   (let [events (atom [])
         a (make {:name "agent" :folder (io/absolute-path ".") :tools tools :autonomy :ask
-                 :program [@stand-in (io/absolute-path script)]
+                 :program (stand-in/command script)
                  :sink (fn [e] (swap! events conj e))})]
     (try
       (agents/start! a)
@@ -184,7 +175,7 @@ handle its requests and tool calls as the IDE would; returns its events."
   (let [events (atom [])
         script (io/path (io/temp-dir "stand-in-script") "never.edn")
         _ (io/write-file script "[[:expect {\"method\" \"never/sent\"}]]")
-        a (codex/adapter {:folder (io/absolute-path ".") :program [@stand-in script]
+        a (codex/adapter {:folder (io/absolute-path ".") :program [@stand-in/program script]
                           :sink (fn [e] (swap! events conj e))})]
     (agents/start! a)
     (is (wait-for 10 (fn [] (seq (events-of events :status)))))

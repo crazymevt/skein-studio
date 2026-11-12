@@ -1,9 +1,10 @@
 ;; Skein Studio, an IDE for Skein written in Skein (Skein's D-102, D-109): Lisp Studio's
-;; design on skein-ui. It uses the skein-ui checkout beside this one; start it with
-;; ./studio [folder].
+;; design on skein-ui. It uses the skein-ui and skein-markdown checkouts beside this one;
+;; start it with ./studio [folder].
 {:name "skein-studio"
  :version "0.1.0"
  :main skein.studio.main/-main
  :paths ["src"]
  :test-paths ["test"]
- :deps {skein/ui {:local "../skein-ui"}}}
+ :deps {skein/ui {:local "../skein-ui"}
+        skein/markdown {:local "../skein-markdown"}}}

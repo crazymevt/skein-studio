@@ -965,7 +965,8 @@ finds."
   [wb]
   (let [c (fn [menu title shortcut f] {:menu menu :title title :shortcut shortcut :run f})
         sep (fn [menu] {:menu menu :separator true})]
-    [(c "File" "Open Folder…" "Primary+Shift+O" (fn [] (choose-folder! wb)))
+    (into
+     [(c "File" "Open Folder…" "Primary+Shift+O" (fn [] (choose-folder! wb)))
      (c "File" "Open File…" "Primary+O" (fn [] (choose-file! wb)))
      (c "File" "Go to File…" "Primary+P" (fn [] (goto-file! wb)))
      (sep "File")
@@ -996,7 +997,37 @@ finds."
      (c "View" "Split Editor" "Primary+\\" (fn [] (split-editor! wb)))
      (sep "View")
      (c "View" "Studio Dark" nil (fn [] (apply-theme! wb "studio-dark")))
-     (c "View" "Studio Light" nil (fn [] (apply-theme! wb "studio-light")))]))
+     (c "View" "Studio Light" nil (fn [] (apply-theme! wb "studio-light")))]
+     ;; and the ones added from outside (the agent panel's)
+     (:extra-commands (state wb)))))
+
+(def ^:private menus)
+
+(defn add-commands!
+  "Add commands ({:menu :title :shortcut :run}) to the workbench's, after its own in their
+menus, as a panel made outside it does."
+  [wb cs]
+  (swap! (:state wb) update :extra-commands (fnil into []) cs)
+  (set-slot! (:window wb) :menu-bar (menus wb)))
+
+;;; The right side: a panel made outside the workbench (the agent's)
+
+(defn set-right-panel!
+  "Put the widget w on the right of the editors, hidden until show-right! shows it."
+  [wb w]
+  (let [right (:right wb)]
+    (doseq [c (:children right)] (ui/remove! right c))
+    (ui/add! right w)))
+
+(defn right-shown?
+  "Whether the right side shows."
+  [wb]
+  (boolean (:visible (:right wb))))
+
+(defn show-right!
+  "Show the right side, or with shown false hide it."
+  ([wb] (show-right! wb true))
+  ([wb shown] (set-slot! (:right wb) :visible (boolean shown))))
 
 (defn command-palette!
   "Choose one of the commands by its name, and run it."
@@ -1093,6 +1124,8 @@ shown. opts: :size [width height]."
          insp (inspector/make-inspector {:part (late inspector-actions :part)
                                          :back (late inspector-actions :back)})
          problems-list (ui/list-box {:items [] :vexpand true :tab-label "Problems"})
+         ;; the right side, which a panel made outside the workbench fills (set-right-panel!)
+         right (ui/vbox {:visible false :width 420 :hexpand false})
          panels (ui/notebook {} (doto (:widget repl-panel) (set-slot! :tab-label "REPL")) output
                              (doto (:widget dbg) (set-slot! :tab-label "Debugger"))
                              (doto (:widget insp) (set-slot! :tab-label "Inspector"))
@@ -1103,8 +1136,11 @@ shown. opts: :size [width height]."
                   (ui/vbox {}
                     (ui/paned {:position 240 :vexpand true}
                               (ui/scrolled-window {} tree)
-                              (ui/paned {:orientation :vertical :position (- height 300)}
-                                        (ui/vbox {} find-bar editor-area) panels))
+                              (ui/hbox {:spacing 1}
+                                (ui/paned {:orientation :vertical :position (- height 300)
+                                           :hexpand true}
+                                          (ui/vbox {} find-bar editor-area) panels)
+                                right))
                     (ui/hbox {:padding [3 10] :spacing 12 :surface :status}
                              message hint position)))
          wb {:window window :tree tree :tabs tabs :editor-area editor-area :palette pal
@@ -1114,7 +1150,8 @@ shown. opts: :size [width height]."
                       :case search-case :results search-results :status search-status}
              :message message :position position
              :hint hint :output output :repl repl-panel :popup popup :state st
-             :debugger dbg :inspector insp :problems-list problems-list :panels panels}]
+             :debugger dbg :inspector insp :problems-list problems-list :panels panels
+             :right right}]
      (reset! wb-ref wb)
      ;; The find bar
      (ui/on find-entry :changed (fn [_] (show-match-count! wb (find-matches wb) nil)))

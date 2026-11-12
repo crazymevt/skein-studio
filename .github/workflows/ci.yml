@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 
-# Skein Studio's tests run with Skein's and skein-ui's main branches, checked out beside
+# Skein Studio's tests run with Skein's, skein-ui's and skein-markdown's main branches, beside
 # this repository (Skein's D-109): ../skein/skein test runs the project's test/ natively.
 # Windows follows skein-ui's Win32 backend (Skein's M2.16).
 jobs:
@@ -39,6 +39,11 @@ jobs:
         with:
           repository: crazymevt/skein-ui
           path: skein-ui
+
+      - uses: actions/checkout@v7
+        with:
+          repository: crazymevt/skein-markdown
+          path: skein-markdown
 
       - name: Install SBCL (macOS)
         if: runner.os == 'macOS'
