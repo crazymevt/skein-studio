@@ -1,0 +1,58 @@
+(ns skein.studio.search
+  "Finding text (Skein's D-109): the matches of a query in a text, as plain text or a
+regular expression, with or without regard to case, and the matches in a folder's files
+as Git sees them."
+  (:require [skein.io :as io]
+            [skein.string :as string]))
+
+(defn- quote-regex [s]
+  (apply str (map (fn [c] (if (contains? (set "\\^$.|?*+()[]{}") c) (str "\\" c) (str c))) s)))
+
+(defn pattern
+  "The regex query stands for: itself if regex, else its text quoted; case-insensitive
+unless match-case. nil if it isn't a valid regex."
+  [query regex match-case]
+  (try (re-pattern (str (if match-case "" "(?i)") (if regex query (quote-regex query))))
+       (catch error e nil)))
+
+(defn matches
+  "[start end] of each match of the query in text, in order (none for an empty query or an
+invalid regex; empty matches are left out). A match's place is where its text comes next,
+from the last match's end, which an anchor or lookaround could in rare cases put early."
+  [text query regex match-case]
+  (if-let [p (when (seq query) (pattern query regex match-case))]
+    (loop [found (re-seq p text) from 0 out (transient [])]
+      (if-let [m (first found)]
+        (let [t (if (string? m) m (first m))
+              s (when (seq t) (string/index-of text t from))]
+          (if s
+            (recur (rest found) (+ s (count t)) (conj! out [s (+ s (count t))]))
+            (recur (rest found) from out)))
+        (persistent! out)))
+    []))
+
+(defn- text-file? [path]
+  (and (< (io/file-size path) 2000000)
+       (let [t (try (io/read-file path) (catch error e nil))]
+         (when (and t (not (string/includes? t "\u0000"))) t))))
+
+(defn in-files
+  "The matches of the query in the folder's files as Git sees them (text files under 2 MB):
+{:file :line :column :text}, line and column from 1 and 0, at most limit of them."
+  [folder query regex match-case limit]
+  (if-let [p (when (seq query) (pattern query regex match-case))]
+    (loop [files (io/walk folder {:dirs false}) out (transient [])]
+      (if (or (empty? files) (>= (count out) limit))
+        (persistent! out)
+        (let [f (first files)
+              text (text-file? f)
+              found (when text
+                      (keep-indexed (fn [i line]
+                                      (when-let [m (re-find p line)]
+                                        (let [t (if (string? m) m (first m))
+                                              col (string/index-of line t)]
+                                          {:file f :line (inc i) :column (or col 0)
+                                           :text (string/trim line)})))
+                                    (string/split text #"\n" -1)))]
+          (recur (rest files) (reduce conj! out found)))))
+    []))

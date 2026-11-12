@@ -32,6 +32,13 @@
         (is (= "main.skn ●" (:tab-label (:view ed))))
         (wb/save-active! w)
         (is (re-find #"^;; native\n" (io/read-file (io/path (wb/folder w) "src/app/main.skn"))))
+        ;; A split, and the find bar finding defn.
+        (wb/split-editor! w)
+        (is (= 2 (count (wb/panes w))))
+        (wb/find! w)
+        (set-slot! (:find-entry w) :text "defn")
+        (wb/find-next! w)
+        (is (= "defn" (ui/selected-text (:view (wb/active-editor w)))))
         (run-for! 0.3)
         (let [png (ui/snapshot (:window w))]
           (is (< 2000 (count png)) "a picture of something")

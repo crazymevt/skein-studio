@@ -258,3 +258,25 @@ start of a top-level form), or nil: whose argument list to show while typing."
                       {:state initial-state :stack []}
                       lines)]
     (first (remove nil? (rseq (:stack stack))))))
+
+(defn definitions
+  "The top-level definitions in the lines of a Skein file: [name line] (line from 0) for
+each form at depth 0 whose head is a definer, by the name that follows it (past any
+^metadata)."
+  [lines]
+  (let [name-of (fn [line tokens]
+                  ;; After the head: skip ^ and the form it marks, take the first symbol.
+                  (loop [ts tokens]
+                    (when-let [[s e kind] (first ts)]
+                      (cond (and (= kind :reader) (= "^" (subs line s e))) (recur (drop 2 ts))
+                            (contains? #{:symbol :head} kind) (subs line s e)
+                            :else nil))))]
+    (loop [ls (map-indexed vector lines) state initial-state out []]
+      (if-let [[l line] (first ls)]
+        (let [[tokens end] (lex-line line state)
+              [t1 t2] tokens
+              name (when (and (= [:code 0] state) t1 (= :open (nth t1 2)) (= 0 (nth t1 3))
+                              t2 (= :head (nth t2 2)) (= :definer (token-style t2 line)))
+                     (name-of line (drop 2 tokens)))]
+          (recur (rest ls) end (if name (conj out [name l]) out)))
+        out))))

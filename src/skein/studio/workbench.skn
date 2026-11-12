@@ -26,6 +26,8 @@ commands here are what its menus do, and what tests call.
             [skein.studio.debugger :as debugger]
             [skein.studio.inspector :as inspector]
             [skein.studio.problems :as problems]
+            [skein.studio.palette :as palette]
+            [skein.studio.search :as search]
             [skein.swank.client :as swank]))
 
 ;;; State
@@ -37,17 +39,31 @@ commands here are what its menus do, and what tests call.
   [wb]
   (:folder (state wb)))
 
+(defn panes
+  "The panes of editor tabs, left to right: one, or two when split."
+  [wb]
+  (:panes (state wb)))
+
+(defn active-pane
+  "The pane of tabs the user last worked in."
+  [wb]
+  (or (:active-pane (state wb)) (first (panes wb))))
+
 (defn editors
-  "The open editors, in tab order: {:document :view}."
+  "The open editors, pane by pane in tab order: {:document :view}. A document open in two
+panes has an editor (a view) in each."
   [wb]
   (let [by-view (:editors (state wb))]
-    (vec (keep (fn [page] (get by-view page)) (:children (:tabs wb))))))
+    (vec (keep (fn [page] (get by-view page)) (mapcat :children (panes wb))))))
 
 (defn active-editor
-  "The editor whose tab shows, or nil."
+  "The editor whose tab shows in the active pane, or nil."
   [wb]
-  (when-let [page (ui/selected-page (:tabs wb))]
+  (when-let [page (ui/selected-page (active-pane wb))]
     (get (:editors (state wb)) page)))
+
+(defn- activate-pane! [wb pane]
+  (swap! (:state wb) assoc :active-pane pane))
 
 (defn current-theme [] (themes/find-theme (settings/setting :theme)))
 
@@ -96,7 +112,7 @@ window's title."
   "What the workbench would restore: {:folder :files :active :size}."
   [wb]
   {:folder (folder wb)
-   :files (mapv (fn [ed] (:path (:document ed))) (editors wb))
+   :files (vec (distinct (map (fn [ed] (:path (:document ed))) (editors wb))))
    :active (when-let [ed (active-editor wb)] (:path (:document ed)))
    :size [(:width (:window wb)) (:height (:window wb))]})
 
@@ -132,18 +148,26 @@ window's title."
     (set-slot! v :wrap (settings/setting :wrap))))
 
 (defn editor-for
-  "The open editor of the file at path, or nil."
+  "An open editor of the file at path, in the active pane if it has one, or nil."
   [wb path]
-  (first (filter (fn [ed] (= path (:path (:document ed)))) (editors wb))))
+  (let [eds (filter (fn [ed] (= path (:path (:document ed)))) (editors wb))]
+    (or (first (filter (fn [ed] (identical? (active-pane wb) (:parent (:view ed)))) eds))
+        (first eds))))
 
-(defn open-file!
-  "Show the file at path in an editor: its tab if it is open, else a new one. Returns the
-editor."
-  [wb path]
-  (if-let [ed (editor-for wb path)]
-    (do (ui/select-page! (:tabs wb) (:view ed)) ed)
-    (let [d (docs/open-document path)
-          l (lang/language-for path)
+(defn- pane-of [ed] (:parent (:view ed)))
+
+(defn show-editor!
+  "Show the editor's tab, in its pane, and make that pane the active one."
+  [wb ed]
+  (activate-pane! wb (pane-of ed))
+  (ui/select-page! (pane-of ed) (:view ed))
+  ed)
+
+(defn- open-view!
+  "A new editor of the document d in pane, shown."
+  [wb d pane]
+  (let [path (:path d)
+        l (lang/language-for path)
           v (editor/make-view (:buffer d) l {:tab-label (docs/document-name d)
                                             :tab-tooltip path})
           ed {:document d :view v}]
@@ -154,13 +178,25 @@ editor."
       (install-assists! wb ed)
       (swap! (:state wb) assoc-in [:editors v] ed)
       (ui/on (:buffer d) :changed (fn [_] (refresh-editor! wb ed)))
-      (ui/on v :selection-changed (fn [_] (refresh-position! wb)))
-      (ui/add! (:tabs wb) v)
-      (ui/select-page! (:tabs wb) v)
+      (ui/on v :selection-changed (fn [_] (activate-pane! wb (pane-of ed)) (refresh-position! wb)))
+      (ui/add! pane v)
+      (show-editor! wb ed)
       (refresh-title! wb)
       (refresh-position! wb)
       (schedule-session-save! wb)
-      ed)))
+      ed))
+
+(defn open-file!
+  "Show the file at path in an editor of the active pane: its tab if it has one, else a
+new one, of the document another pane has open if one does. Returns the editor."
+  [wb path]
+  (let [here (first (filter (fn [ed] (and (= path (:path (:document ed)))
+                                          (identical? (active-pane wb) (pane-of ed))))
+                            (editors wb)))]
+    (if here
+      (show-editor! wb here)
+      (open-view! wb (or (:document (editor-for wb path)) (docs/open-document path))
+                  (active-pane wb)))))
 
 (defn save-editor!
   "Save the editor's document. Returns the editor."
@@ -181,18 +217,28 @@ editor."
   (doseq [ed (editors wb)]
     (when (docs/modified? (:document ed)) (save-editor! wb ed))))
 
+(defn- other-views? [wb ed]
+  (some (fn [x] (and (identical? (:document x) (:document ed)) (not (identical? x ed))))
+        (editors wb)))
+
+(def ^:private ask-to-save?)
+
 (defn- may-close?
-  "Ask, if the editor has unsaved changes, whether to save them: true to go on closing
-(saved or discarded), false to keep it open."
+  "Ask, if the editor has unsaved changes and is its document's last, whether to save
+them: true to go on closing (saved or discarded), false to keep it open."
   [wb ed]
-  (if-not (docs/modified? (:document ed))
-    true
-    (case (ui/message-box (str "Save the changes to " (docs/document-name (:document ed)) "?")
+  (or (not (docs/modified? (:document ed))) (other-views? wb ed) (ask-to-save? wb ed)))
+
+(defn- ask-to-save?
+  "Ask whether to save the editor's document's changes: true to go on (saved or
+discarded), false to stop."
+  [wb ed]
+  (case (ui/message-box (str "Save the changes to " (docs/document-name (:document ed)) "?")
                           {:detail "They are lost if you don't save them."
                            :type :warning :buttons :save-discard-cancel :parent (:window wb)})
-      :save (do (save-editor! wb ed) true)
-      :discard true
-      false)))
+    :save (do (save-editor! wb ed) true)
+    :discard true
+    false))
 
 (defn- forget-editor! [wb ed]
   (swap! (:state wb) update :editors dissoc (:view ed))
@@ -204,7 +250,7 @@ editor."
   "Close the editor's tab, asking first about unsaved changes (as its close button does).
 Returns true if it closed."
   [wb ed]
-  (boolean (ui/close-page! (:tabs wb) (:view ed))))
+  (boolean (ui/close-page! (pane-of ed) (:view ed))))
 
 (defn close-active!
   "Close the active editor."
@@ -214,7 +260,9 @@ Returns true if it closed."
 (defn may-quit?
   "Ask about every document with unsaved changes; true if the window may close."
   [wb]
-  (every? (fn [ed] (may-close? wb ed)) (editors wb)))
+  ;; One editor of each document, so a document open in two panes is asked about once.
+  (every? (fn [[d eds]] (or (not (docs/modified? d)) (ask-to-save? wb (first eds))))
+          (group-by :document (editors wb))))
 
 ;;; Files changed on disk: an editor without unsaved changes reads its file again; one with
 ;;; them says so in the status bar.
@@ -509,7 +557,7 @@ caret there. Returns the editor, or nil."
                                                 (pr-str loc))))
       (let [v (:view ed)
             p (location-position (:buffer v) (:line at) (:column at))]
-        (ui/select-page! (:tabs wb) v)
+        (show-editor! wb ed)
         (ui/set-cursor! v p)
         (ui/scroll-to-position! v p)
         (ui/focus! v)
@@ -699,42 +747,287 @@ characters or more."
                (schedule! wb :complete 0.25 (fn [] (offer-completions! wb ed))))))
     (check-reading! wb ed)))
 
+;;; Panes of tabs: one, or two side by side when split. A pane closes with its last tab,
+;;; the first excepted.
+
+(defn- install-pane!
+  "Make pane one of the workbench's panes of editor tabs."
+  [wb pane]
+  (swap! (:state wb) update :panes conj pane)
+  ;; Closing a tab asks about unsaved changes first; a closed one is forgotten.
+  (ui/on pane :page-close-request
+         (fn [e]
+           (when-let [ed (get (:editors (state wb)) (:value e))]
+             (when-not (may-close? wb ed) (ui/veto e)))))
+  (ui/on pane :page-closed
+         (fn [e]
+           (when-let [ed (get (:editors (state wb)) (:value e))]
+             (forget-editor! wb ed))
+           (when (and (empty? (:children pane)) (not (identical? pane (first (panes wb)))))
+             (swap! (:state wb)
+                    (fn [st] (assoc st
+                                    :panes (filterv (fn [p] (not (identical? p pane))) (:panes st))
+                                    :active-pane (first (:panes st)))))
+             (ui/remove! (:editor-area wb) pane)
+             (ui/destroy! pane)
+             (refresh-title! wb))))
+  (ui/on pane :page-changed (fn [_] (activate-pane! wb pane) (refresh-title! wb)
+                              (refresh-position! wb) (schedule-session-save! wb)))
+  pane)
+
+(defn split-editor!
+  "Show the active document in a second pane beside the first too, or, already split,
+in the other pane."
+  [wb]
+  (when-let [ed (active-editor wb)]
+    (let [others (filter (fn [p] (not (identical? p (pane-of ed)))) (panes wb))
+          pane (or (first others)
+                   (let [p (ui/tabbed-pane {:vexpand true :hexpand true})]
+                     (ui/add! (:editor-area wb) p)
+                     (install-pane! wb p)))]
+      (activate-pane! wb pane)
+      (open-file! wb (:path (:document ed))))))
+
+;;; Going to a line, a file or a symbol
+
+(defn goto-line!
+  "Put the active editor's caret at the start of line (from 1)."
+  [wb line]
+  (when-let [ed (active-editor wb)]
+    (let [v (:view ed)
+          p (location-position (:buffer v) line 0)]
+      (ui/set-cursor! v p)
+      (ui/scroll-to-position! v p)
+      (ui/focus! v))))
+
+(defn ask-goto-line!
+  "Ask for a line number and go there."
+  [wb]
+  (when (active-editor wb)
+    (when-let [answer (ui/prompt-text "Go to line" {:parent (:window wb)})]
+      (if-let [n (parse-long (string/trim answer))]
+        (goto-line! wb n)
+        (message! wb (str "Not a line number: " answer))))))
+
+(defn project-files
+  "The folder's files as Git sees them, relative to it, at most 20,000."
+  [wb]
+  (if-let [f (folder wb)]
+    (let [prefix (count (str f "/"))]
+      (vec (take 20000 (map (fn [p] (subs p prefix)) (io/walk f {:dirs false})))))
+    []))
+
+(defn goto-file!
+  "Choose one of the folder's files, by its path, and open it."
+  [wb]
+  (palette/open! (:palette wb) (active-pane wb) "Go to file"
+                 (mapv (fn [rel] {:label rel :path (io/path (folder wb) rel)}) (project-files wb))
+                 (fn [it] (open-file! wb (:path it)))))
+
+(defn goto-symbol!
+  "Choose one of the active Skein file's definitions and go to it."
+  [wb]
+  (when-let [ed (active-editor wb)]
+    (let [b (:buffer (:view ed))
+          lines (mapv (fn [l] (ui/line-text b l)) (range (ui/buffer-line-count b)))]
+      (palette/open! (:palette wb) (active-pane wb) "Go to symbol"
+                     (mapv (fn [[nm l]] {:label nm :detail (str "line " (inc l)) :line (inc l)})
+                           (sk/definitions lines))
+                     (fn [it] (goto-line! wb (:line it)))))))
+
+;;; Find and replace in the active editor: the find bar above the editors.
+
+(defn- find-options [wb]
+  {:query (:text (:find-entry wb)) :regex (:checked (:find-regex wb))
+   :case (:checked (:find-case wb))})
+
+(defn find-matches
+  "The find bar's matches in the active editor's text."
+  [wb]
+  (if-let [ed (active-editor wb)]
+    (let [{:keys [query regex case]} (find-options wb)]
+      (search/matches (ui/buffer-text (:buffer (:view ed))) query regex case))
+    []))
+
+(defn- show-match-count! [wb ms current]
+  (set-slot! (:find-count wb) :text
+             (cond (empty? (:query (find-options wb))) ""
+                   (empty? ms) "No matches"
+                   current (str (inc current) " of " (count ms))
+                   :else (str (count ms) " matches"))))
+
+(defn find-next!
+  "Select the next match after the selection (back from it if backward), around the end."
+  ([wb] (find-next! wb false))
+  ([wb backward]
+   (when-let [ed (active-editor wb)]
+     (let [v (:view ed)
+           ms (find-matches wb)
+           [s e] (ui/selection v)
+           i (if backward
+               (or (last (keep-indexed (fn [i [ms _]] (when (< ms s) i)) ms)) (dec (count ms)))
+               (or (first (keep-indexed (fn [i [ms _]] (when (>= ms e) i)) ms)) 0))]
+       (if-let [[ms me] (get ms i)]
+         (do (ui/set-selection! v ms me)
+             (ui/scroll-to-position! v ms)
+             (show-match-count! wb (find-matches wb) i))
+         (show-match-count! wb ms nil))))))
+
+(defn find!
+  "Show the find bar, with the selection as what to find."
+  [wb]
+  (set-slot! (:find-bar wb) :visible true)
+  (when-let [ed (active-editor wb)]
+    (let [v (:view ed)]
+      (when-not (ui/selection-empty? v)
+        (let [[s e] (ui/selection v)]
+          (when (= (ui/position-line (:buffer v) s) (ui/position-line (:buffer v) e))
+            (set-slot! (:find-entry wb) :text (ui/selected-text v)))))))
+  (ui/focus! (:find-entry wb)))
+
+(defn hide-find! [wb]
+  (set-slot! (:find-bar wb) :visible false)
+  (when-let [ed (active-editor wb)] (ui/focus! (:view ed))))
+
+(defn- replacement [wb matched]
+  (let [{:keys [query regex case]} (find-options wb)
+        with (:text (:replace-entry wb))]
+    (if regex
+      (string/replace-first matched (search/pattern query true case) with)
+      with)))
+
+(defn replace!
+  "Replace the selection if it is a match, then select the next."
+  [wb]
+  (when-let [ed (active-editor wb)]
+    (let [v (:view ed)
+          sel (ui/selection v)]
+      (when (some (fn [m] (= m sel)) (find-matches wb))
+        (ui/replace-selection! v (replacement wb (ui/selected-text v))))
+      (find-next! wb))))
+
+(defn replace-all!
+  "Replace every match in the active editor, as one change. Returns how many."
+  [wb]
+  (when-let [ed (active-editor wb)]
+    (let [b (:buffer (:view ed))
+          ms (find-matches wb)]
+      (ui/with-undo-group [b]
+        (doseq [[s e] (reverse ms)]
+          (ui/replace-buffer-range! b s e (replacement wb (ui/buffer-text b s e)))))
+      (message! wb (str "Replaced " (count ms)))
+      (show-match-count! wb (find-matches wb) nil)
+      (count ms))))
+
+;;; Find in files: the Search panel.
+
+(defn find-in-files!
+  "Search the folder's files for the Search panel's query, on a fiber, and list what it
+finds."
+  [wb]
+  (when-let [f (folder wb)]
+    (let [{:keys [entry regex case results status]} (:search wb)
+          query (:text entry)
+          prefix (count (str f "/"))]
+      (set-slot! status :text "Searching…")
+      (async! (fn [] (search/in-files f query (:checked regex) (:checked case) 2000))
+              (fn [r]
+                (let [found (or (:value r) [])]
+                  (swap! (:state wb) assoc :search-results found)
+                  (set-slot! results :items
+                             (mapv (fn [m] (str (subs (:file m) prefix) ":" (:line m) ": "
+                                                (:text m)))
+                                   found))
+                  (set-slot! status :text
+                             (if (:error r) (reason (:error r))
+                                 (str (count found) (if (= 2000 (count found)) "+" "")
+                                      " matches")))))))))
+
+(defn show-search!
+  "Show the Search panel, with the selection as the query."
+  [wb]
+  (show-panel! wb (:widget (:search wb)))
+  (when-let [ed (active-editor wb)]
+    (when-not (ui/selection-empty? (:view ed))
+      (set-slot! (:entry (:search wb)) :text (ui/selected-text (:view ed)))))
+  (ui/focus! (:entry (:search wb))))
+
+;;; Commands: what the menus and the command palette do.
+
+(def command-palette!
+  "Choose one of the commands by its name, and run it (defined below).")
+
+(defn commands
+  "The workbench's commands, in their menus' order: {:menu :title :shortcut :run}, or
+{:menu m :separator true}."
+  [wb]
+  (let [c (fn [menu title shortcut f] {:menu menu :title title :shortcut shortcut :run f})
+        sep (fn [menu] {:menu menu :separator true})]
+    [(c "File" "Open Folder…" "Primary+Shift+O" (fn [] (choose-folder! wb)))
+     (c "File" "Open File…" "Primary+O" (fn [] (choose-file! wb)))
+     (c "File" "Go to File…" "Primary+P" (fn [] (goto-file! wb)))
+     (sep "File")
+     (c "File" "Save" "Primary+S" (fn [] (save-active! wb)))
+     (c "File" "Save All" "Primary+Alt+S" (fn [] (save-all! wb)))
+     (sep "File")
+     (c "File" "Close Tab" "Primary+W" (fn [] (close-active! wb)))
+     (c "Find" "Find…" "Primary+F" (fn [] (find! wb)))
+     (c "Find" "Find Next" "Primary+G" (fn [] (find-next! wb)))
+     (c "Find" "Find Previous" "Primary+Shift+G" (fn [] (find-next! wb true)))
+     (c "Find" "Replace All" nil (fn [] (replace-all! wb)))
+     (sep "Find")
+     (c "Find" "Find in Files…" "Primary+Shift+F" (fn [] (show-search! wb)))
+     (sep "Find")
+     (c "Find" "Go to Line…" "Primary+L" (fn [] (ask-goto-line! wb)))
+     (c "Find" "Go to Symbol…" "Primary+Shift+T" (fn [] (goto-symbol! wb)))
+     (c "Find" "Go to Definition" "Alt+." (fn [] (goto-definition! wb)))
+     (c "Run" "Run Program" "Primary+R" (fn [] (run-program! wb)))
+     (c "Run" "Stop Program" "Primary+." (fn [] (stop-program! wb)))
+     (c "Run" "Connect to Swank…" nil (fn [] (connect-swank! wb)))
+     (c "Eval" "Evaluate Form" "Primary+Return" (fn [] (eval-form! wb)))
+     (c "Eval" "Compile Form" "Primary+K" (fn [] (compile-form! wb)))
+     (c "Eval" "Load File" "Primary+Shift+Return" (fn [] (eval-file! wb)))
+     (c "Eval" "Compile File" "Primary+Shift+K" (fn [] (compile-file! wb)))
+     (sep "Eval")
+     (c "Eval" "Inspect Form" "Primary+I" (fn [] (inspect-form! wb)))
+     (c "View" "Command Palette…" "Primary+Shift+P" (fn [] (command-palette! wb)))
+     (c "View" "Split Editor" "Primary+\\" (fn [] (split-editor! wb)))
+     (sep "View")
+     (c "View" "Studio Dark" nil (fn [] (apply-theme! wb "studio-dark")))
+     (c "View" "Studio Light" nil (fn [] (apply-theme! wb "studio-light")))]))
+
+(defn command-palette!
+  "Choose one of the commands by its name, and run it."
+  [wb]
+  (palette/open! (:palette wb) (active-pane wb) "Run a command"
+                 (vec (keep (fn [c] (when-not (:separator c)
+                                      {:label (str (:menu c) ": " (:title c))
+                                       :detail (when (:shortcut c)
+                                                 (ui/shortcut-label (:shortcut c)))
+                                       :run (:run c)}))
+                            (commands wb)))
+                 (fn [it] ((:run it)))))
+
 ;;; Menus
 
-(defn- item [label shortcut f]
-  (ui/menu-item (merge {:label label :on-activate (fn [_] (f))}
-                       (when shortcut {:shortcut shortcut}))))
+(defn- menu-items [wb menu]
+  (mapv (fn [c] (if (:separator c)
+                  (ui/menu-separator)
+                  (ui/menu-item (merge {:label (:title c) :on-activate (fn [_] ((:run c)))}
+                                       (when (:shortcut c) {:shortcut (:shortcut c)})))))
+        (filter (fn [c] (= menu (:menu c))) (commands wb))))
 
 (defn- menus [wb]
   (ui/menu-bar {}
-    (ui/menu {:title "File"}
-      (item "Open Folder…" "Primary+Shift+O" (fn [] (choose-folder! wb)))
-      (item "Open File…" "Primary+O" (fn [] (choose-file! wb)))
-      (ui/menu-separator)
-      (item "Save" "Primary+S" (fn [] (save-active! wb)))
-      (item "Save All" "Primary+Alt+S" (fn [] (save-all! wb)))
-      (ui/menu-separator)
-      (item "Close Tab" "Primary+W" (fn [] (close-active! wb)))
-      (ui/menu-item {:role :quit}))
+    (apply ui/menu {:title "File"} (conj (menu-items wb "File") (ui/menu-item {:role :quit})))
     (ui/menu {:title "Edit"}
       (ui/menu-item {:role :undo}) (ui/menu-item {:role :redo}) (ui/menu-separator)
       (ui/menu-item {:role :cut}) (ui/menu-item {:role :copy}) (ui/menu-item {:role :paste})
       (ui/menu-item {:role :select-all}))
-    (ui/menu {:title "Run"}
-      (item "Run Program" "Primary+R" (fn [] (run-program! wb)))
-      (item "Stop Program" "Primary+." (fn [] (stop-program! wb)))
-      (item "Connect to Swank…" nil (fn [] (connect-swank! wb))))
-    (ui/menu {:title "Eval"}
-      (item "Evaluate Form" "Primary+Return" (fn [] (eval-form! wb)))
-      (item "Compile Form" "Primary+K" (fn [] (compile-form! wb)))
-      (item "Load File" "Primary+Shift+Return" (fn [] (eval-file! wb)))
-      (item "Compile File" "Primary+Shift+K" (fn [] (compile-file! wb)))
-      (ui/menu-separator)
-      (item "Inspect Form" "Primary+I" (fn [] (inspect-form! wb)))
-      (item "Go to Definition" "Alt+." (fn [] (goto-definition! wb))))
-    (ui/menu {:title "View"}
-      (item "Studio Dark" nil (fn [] (apply-theme! wb "studio-dark")))
-      (item "Studio Light" nil (fn [] (apply-theme! wb "studio-light"))))))
+    (apply ui/menu {:title "Find"} (menu-items wb "Find"))
+    (apply ui/menu {:title "Run"} (menu-items wb "Run"))
+    (apply ui/menu {:title "Eval"} (menu-items wb "Eval"))
+    (apply ui/menu {:title "View"} (menu-items wb "View"))))
 
 ;;; The window
 
@@ -745,7 +1038,7 @@ shown. opts: :size [width height]."
   ([opts]
    (let [theme (current-theme)
          [width height] (or (:size opts) [1100 720])
-         st (atom {:editors {}})
+         st (atom {:editors {} :panes []})
          wb-ref (atom nil)
          tree (ui/tree-view {:roots [] :item-label io/file-name :children-fn (fn [_] [])
                              :on-row-activated (fn [e]
@@ -753,6 +1046,30 @@ shown. opts: :size [width height]."
                                                    (when (io/file? p)
                                                      (open-file! @wb-ref p))))})
          tabs (ui/tabbed-pane {:vexpand true :hexpand true})
+         editor-area (ui/hbox {:vexpand true :hexpand true :spacing 1} tabs)
+         ;; Fixed widths, so the options and the count keep their labels.
+         find-entry (ui/entry {:placeholder "Find" :width 180})
+         replace-entry (ui/entry {:placeholder "Replace with" :width 150})
+         find-regex (ui/check-box {:label "Regex" :width 74})
+         find-case (ui/check-box {:label "Match Case" :width 110})
+         find-count (ui/label {:text "" :text-color :secondary-text :width 80})
+         find-prev (ui/button {:label "Previous"})
+         find-next (ui/button {:label "Next"})
+         replace-one (ui/button {:label "Replace"})
+         replace-every (ui/button {:label "Replace All"})
+         find-close (ui/button {:label "Done"})
+         find-bar (ui/hbox {:padding [4 8] :spacing 6 :visible false}
+                    find-entry find-regex find-case find-prev find-next find-count
+                    replace-entry replace-one replace-every find-close)
+         search-entry (ui/entry {:placeholder "Find in files" :hexpand true})
+         search-regex (ui/check-box {:label "Regex"})
+         search-case (ui/check-box {:label "Match Case"})
+         search-results (ui/list-box {:items [] :vexpand true})
+         search-status (ui/label {:text "" :text-color :secondary-text})
+         search-panel (ui/vbox {:padding 8 :spacing 6 :tab-label "Search"}
+                        (ui/hbox {:spacing 6} search-entry search-regex search-case)
+                        search-results search-status)
+         pal (palette/make-palette)
          message (ui/label {:text "" :text-color :secondary-text :hexpand true})
          hint (ui/label {:text "" :text-color :secondary-text})
          position (ui/label {:text "" :text-color :secondary-text})
@@ -777,7 +1094,7 @@ shown. opts: :size [width height]."
          panels (ui/notebook {} (doto (:widget repl-panel) (set-slot! :tab-label "REPL")) output
                              (doto (:widget dbg) (set-slot! :tab-label "Debugger"))
                              (doto (:widget insp) (set-slot! :tab-label "Inspector"))
-                             problems-list)
+                             problems-list search-panel)
          window (ui/window {:title "Skein Studio" :width width :height height
                             :appearance (:appearance theme)
                             :palette (themes/widget-palette theme)}
@@ -785,13 +1102,37 @@ shown. opts: :size [width height]."
                     (ui/paned {:position 240 :vexpand true}
                               (ui/scrolled-window {} tree)
                               (ui/paned {:orientation :vertical :position (- height 300)}
-                                        tabs panels))
+                                        (ui/vbox {} find-bar editor-area) panels))
                     (ui/hbox {:padding [3 10] :spacing 12 :surface :status}
                              message hint position)))
-         wb {:window window :tree tree :tabs tabs :message message :position position
+         wb {:window window :tree tree :tabs tabs :editor-area editor-area :palette pal
+             :find-bar find-bar :find-entry find-entry :replace-entry replace-entry
+             :find-regex find-regex :find-case find-case :find-count find-count
+             :search {:widget search-panel :entry search-entry :regex search-regex
+                      :case search-case :results search-results :status search-status}
+             :message message :position position
              :hint hint :output output :repl repl-panel :popup popup :state st
              :debugger dbg :inspector insp :problems-list problems-list :panels panels}]
      (reset! wb-ref wb)
+     ;; The find bar
+     (ui/on find-entry :changed (fn [_] (show-match-count! wb (find-matches wb) nil)))
+     (ui/on find-entry :activate (fn [_] (find-next! wb)))
+     (ui/on replace-entry :activate (fn [_] (replace! wb)))
+     (doseq [x [find-entry replace-entry]]
+       (ui/on x :key-down (fn [e] (when (= :escape (:key e)) (hide-find! wb) (ui/consume! e)))))
+     (doseq [x [find-regex find-case]]
+       (ui/on x :toggled (fn [_] (show-match-count! wb (find-matches wb) nil))))
+     (ui/on find-prev :clicked (fn [_] (find-next! wb true)))
+     (ui/on find-next :clicked (fn [_] (find-next! wb)))
+     (ui/on replace-one :clicked (fn [_] (replace! wb)))
+     (ui/on replace-every :clicked (fn [_] (replace-all! wb)))
+     (ui/on find-close :clicked (fn [_] (hide-find! wb)))
+     ;; The Search panel
+     (ui/on search-entry :activate (fn [_] (find-in-files! wb)))
+     (ui/on search-results :row-activated
+            (fn [e] (when-let [m (get (:search-results @st) (:index e))]
+                      (goto-location! wb (list :location (list :file (:file m))
+                                               (list :line (:line m) (:column m)) nil)))))
      (ui/on problems-list :row-activated
             (fn [e] (when-let [p (get (:problem-list @st) (:index e))]
                       (goto-location! wb (list :location (list :file (:file p))
@@ -806,17 +1147,7 @@ shown. opts: :size [width height]."
                        (ui/replace-selection! v (:value e))
                        (finally (swap! st dissoc :accepting)))))))
      (set-slot! window :menu-bar (menus wb))
-     ;; Closing a tab asks about unsaved changes first; a closed one is forgotten.
-     (ui/on tabs :page-close-request
-            (fn [e]
-              (when-let [ed (get (:editors @st) (:value e))]
-                (when-not (may-close? wb ed) (ui/veto e)))))
-     (ui/on tabs :page-closed
-            (fn [e]
-              (when-let [ed (get (:editors @st) (:value e))]
-                (forget-editor! wb ed))))
-     (ui/on tabs :page-changed (fn [_] (refresh-title! wb) (refresh-position! wb)
-                                 (schedule-session-save! wb)))
+     (install-pane! wb tabs)
      (ui/on window :close-request (fn [e] (when-not (may-quit? wb) (ui/veto e))))
      (ui/on window :resize (fn [_] (schedule-session-save! wb)))
      (ui/on window :closed (fn [_] (stop-watching! wb) (stop-program! wb) (save-session! wb)

@@ -1,0 +1,146 @@
+(ns skein.studio.commands-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.studio.settings :as settings]
+            [skein.studio.lang.skein :as sk]
+            [skein.studio.palette :as palette]
+            [skein.studio.search :as search]
+            [skein.studio.workbench :as wb]))
+
+;; Commands and search (Skein's M3.7 step 5, D-109), on the headless backend.
+
+(use-fixtures :each
+  (fn [t]
+    (ui/use-backend! (headless/backend))
+    (binding [settings/*config-dir* (io/temp-dir "studio-config")]
+      (settings/load-settings!)
+      (t))))
+
+(deftest matching
+  (is (= [[0 3] [8 11]] (search/matches "foo bar Foo" "foo" false false)))
+  (is (= [[0 3]] (search/matches "foo bar Foo" "foo" false true)) "match case")
+  (is (= [[4 6] [7 10]] (search/matches "abc 12 345" "\\d+" true false)))
+  (is (= [[1 2]] (search/matches "a.b" "." false false)) "plain text is quoted")
+  (is (= [] (search/matches "abc" "(" true false)) "an invalid regex matches nothing")
+  (is (= [] (search/matches "abc" "" false false))))
+
+(deftest the-palette-ranks-fuzzily
+  (is (nil? (palette/fuzzy-score "xyz" "Save All")))
+  (is (some? (palette/fuzzy-score "sva" "File: Save All")))
+  (is (= ["File: Save" "File: Save All"]
+         (mapv :label (palette/matching [{:label "File: Save All"} {:label "Find: Find in Files…"}
+                                         {:label "File: Save"}]
+                                        "save")))
+      "only what matches, the shorter first")
+  (is (= ["b" "a"] (mapv :label (palette/matching [{:label "b"} {:label "a"}] "")))
+      "no query keeps the order"))
+
+(deftest definitions
+  (is (= [["a" 0] ["f" 2] ["x" 4] ["g" 6]]
+         (sk/definitions ["(ns a)" "" "(defn f [x]" "  (def inner 1))" "(def ^:private x 1)" ""
+                          "(defmacro g [] nil)" "(foo h)"]))))
+
+(defn- project []
+  (let [root (io/temp-dir "studio-cmds")]
+    (io/make-dirs (io/path root "src/app"))
+    (io/write-file (io/path root "src/app/main.skn")
+                   (str "(ns app.main)\n\n(defn add [a b]\n  (+ a b))\n\n"
+                        "(defn twice [x]\n  (add x x))\n"))
+    (io/write-file (io/path root "src/app/util.skn") "(ns app.util)\n\n(def answer 42)\n")
+    (io/write-file (io/path root "README.md") "# App\nadd things\n")
+    root))
+
+(defn- wait-for [secs done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n (* secs 10)) (done?)
+          :else (do (headless/advance! 0.1) (sleep 0.1) (recur (inc n))))))
+
+(deftest the-commands
+  (let [w (wb/make-workbench)
+        root (project)]
+    (ui/show! (:window w))
+    (wb/open-folder! w root)
+    (let [main (io/path (wb/folder w) "src/app/main.skn")
+          util (io/path (wb/folder w) "src/app/util.skn")]
+      (testing "split editors share a document"
+        (let [ed (wb/open-file! w main)]
+          (wb/split-editor! w)
+          (is (= 2 (count (wb/panes w))))
+          (let [ed2 (wb/active-editor w)]
+            (is (not (identical? (:view ed) (:view ed2))))
+            (is (identical? (:document ed) (:document ed2)))
+            (ui/insert-into-buffer! (:buffer (:view ed2)) 0 ";; both\n")
+            (is (string/starts-with? (ui/code-text (:view ed)) ";; both"))
+            (is (wb/close-editor! w ed2) "another view stays open: nothing to ask")
+            (is (= 1 (count (wb/panes w))) "the split goes with its last tab")
+            (wb/save-active! w))))
+      (testing "the command palette"
+        (wb/command-palette! w)
+        (is (:shown (:popover (:palette w))))
+        (headless/edit-text! (:entry (:palette w)) "split edi")
+        (is (string/starts-with? (first (:items (:list (:palette w)))) "View: Split Editor"))
+        (ui/emit! (:entry (:palette w)) (ui/event-for (:entry (:palette w)) :activate))
+        (is (= 2 (count (wb/panes w))) "it ran")
+        (wb/close-active! w))
+      (testing "going to a file"
+        (wb/goto-file! w)
+        (headless/edit-text! (:entry (:palette w)) "util")
+        (is (= "src/app/util.skn" (first (:items (:list (:palette w))))))
+        (palette/choose! (:palette w) 0)
+        (is (= util (:path (:document (wb/active-editor w))))))
+      (testing "going to a symbol and a line"
+        (wb/open-file! w main)
+        (wb/goto-symbol! w)
+        (is (= ["app.main   line 2" "add   line 4" "twice   line 7"] (:items (:list (:palette w))))
+            "the ns, then the definitions")
+        (headless/edit-text! (:entry (:palette w)) "twi")
+        (palette/choose! (:palette w) 0)
+        (let [v (:view (wb/active-editor w))]
+          (is (= 6 (ui/position-line (:buffer v) (:cursor v))))
+          (wb/goto-line! w 1)
+          (is (= 0 (:cursor v)))))
+      (testing "find and replace"
+        (let [v (:view (wb/active-editor w))]
+          (wb/find! w)
+          (is (:visible (:find-bar w)))
+          (headless/edit-text! (:find-entry w) "add")
+          (is (= "2 matches" (:text (:find-count w))) "(defn add and (add x x)")
+          (wb/find-next! w)
+          (is (= "add" (ui/selected-text v)))
+          (is (= "1 of 2" (:text (:find-count w))))
+          (wb/find-next! w)
+          (is (= "2 of 2" (:text (:find-count w))))
+          (wb/find-next! w true)
+          (is (= "1 of 2" (:text (:find-count w))) "back again")
+          (set-slot! (:replace-entry w) :text "plus")
+          (wb/replace! w)
+          (is (string/includes? (ui/code-text v) "(defn plus [a b]"))
+          (is (= 1 (count (wb/find-matches w))))
+          (set-slot! (:find-regex w) :checked true)
+          (set-slot! (:find-entry w) :text "(\\w+) x x")
+          (set-slot! (:replace-entry w) :text "$1 y y")
+          (is (= 1 (wb/replace-all! w)))
+          (is (string/includes? (ui/code-text v) "(add y y)"))
+          (ui/undo! (:buffer v))
+          (is (string/includes? (ui/code-text v) "(add x x)") "one change undoes them all")
+          (wb/hide-find! w)
+          (is (not (:visible (:find-bar w))))))
+      (testing "find in files"
+        (wb/show-search! w)
+        (set-slot! (:entry (:search w)) :text "add")
+        (wb/find-in-files! w)
+        (is (wait-for 10 (fn [] (seq (:items (:results (:search w)))))))
+        (is (some (fn [line] (string/starts-with? line "README.md:2:"))
+                  (:items (:results (:search w)))))
+        (let [i (first (keep-indexed (fn [i line] (when (string/starts-with? line "src/app/util")
+                                                    i))
+                                     (:items (:results (:search w)))))]
+          (is (nil? i) "util.skn has no add"))
+        (ui/row-activated-by-user! (:results (:search w)) 0)
+        (is (= "Search" (:tab-label (nth (:children (:panels w)) (:selected-index (:panels w))))))))
+    (headless/answer! 1 1 1)
+    (ui/close! (:window w))))

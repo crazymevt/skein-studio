@@ -1,0 +1,90 @@
+(ns skein.studio.palette
+  "The palette (Skein's D-109): a popover with an entry over a list, the list's items
+filtered as the user types by a fuzzy match of their labels (the typed characters in order,
+words' starts and runs scoring higher). Return or a double-click chooses an item; Up and
+Down move in the list from the entry. The command palette, Go to File and Go to Symbol are
+palettes."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]))
+
+(defn fuzzy-score
+  "How well query matches text (case aside): nil if its characters don't all come in
+order, else a score, higher for matches at the start of words and in runs, and for shorter
+texts."
+  [query text]
+  (let [q (string/lower-case query)
+        t (string/lower-case text)
+        nq (count q)
+        nt (count t)
+        word-start? (fn [i] (or (zero? i) (contains? (set " -_./:") (nth t (dec i)))))]
+    (loop [qi 0 ti 0 score 0 prev -2]
+      (cond (= qi nq) (- score (* 0.01 nt))
+            (= ti nt) nil
+            (= (nth q qi) (nth t ti))
+            (recur (inc qi) (inc ti)
+                   (+ score 1 (if (word-start? ti) 3 0) (if (= ti (inc prev)) 2 0))
+                   ti)
+            :else (recur qi (inc ti) score prev)))))
+
+(defn matching
+  "The items whose :label query matches, best first (all of them, in order, for no query)."
+  [items query]
+  (if (string/blank? query)
+    (vec items)
+    (->> items
+         (keep (fn [it] (when-let [sc (fuzzy-score query (:label it))] [sc it])))
+         (sort-by (fn [[sc _]] (- sc)))
+         (mapv second))))
+
+(def ^:private shown-limit 200)
+
+(defn make-palette
+  "A palette: {:popover :entry :list :state}."
+  []
+  (let [entry (ui/entry {:placeholder "" :hexpand true})
+        lst (ui/list-box {:items [] :vexpand true})
+        pop (ui/popover {} (ui/vbox {:padding 6 :spacing 6 :width 520 :height 320} entry lst))
+        st (atom {:items [] :shown [] :choose nil})
+        p {:popover pop :entry entry :list lst :state st}
+        refilter! (fn []
+                    (let [shown (vec (take shown-limit (matching (:items @st) (:text entry))))]
+                      (swap! st assoc :shown shown)
+                      (set-slot! lst :items (mapv (fn [it] (if (:detail it)
+                                                             (str (:label it) "   " (:detail it))
+                                                             (:label it)))
+                                                  shown))
+                      (set-slot! lst :selected-indices (if (seq shown) [0] []))))
+        choose! (fn [i]
+                  (when-let [it (get (:shown @st) i)]
+                    (ui/close-surface! pop)
+                    ((:choose @st) it)))]
+    (swap! st assoc :refilter refilter! :choose-at choose!)
+    (ui/on entry :changed (fn [_] (refilter!)))
+    (ui/on entry :activate (fn [_] (choose! (or (first (:selected-indices lst)) 0))))
+    (ui/on entry :key-down
+           (fn [e]
+             (let [n (count (:shown @st))
+                   i (or (first (:selected-indices lst)) 0)]
+               (case (:key e)
+                 :down (do (set-slot! lst :selected-indices [(min (dec n) (inc i))])
+                           (ui/consume! e))
+                 :up (do (set-slot! lst :selected-indices [(max 0 (dec i))]) (ui/consume! e))
+                 nil))))
+    (ui/on lst :row-activated (fn [e] (choose! (:index e))))
+    p))
+
+(defn open!
+  "Show the palette for widget with items ({:label :detail} maps and anything else they
+carry), placeholder in its entry; choose is called with the item chosen."
+  [p widget placeholder items choose]
+  (swap! (:state p) assoc :items (vec items) :choose choose)
+  (set-slot! (:entry p) :placeholder placeholder)
+  (set-slot! (:entry p) :text "")
+  ((:refilter @(:state p)))
+  (ui/show-popover! (:popover p) widget {:focus (:entry p)})
+  p)
+
+(defn choose!
+  "Choose the item at index of those shown, as a double-click does."
+  [p index]
+  ((:choose-at @(:state p)) index))
