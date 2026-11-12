@@ -10,6 +10,7 @@
             [skein.studio.editor :as editor]
             [skein.studio.highlight :as highlight]
             [skein.studio.inferior :as inferior]
+            [skein.studio.agents.tools :as tools]
             [skein.studio.repl :as repl]
             [skein.studio.workbench :as wb]
             [skein.process :as process]
@@ -202,6 +203,29 @@
             (wb/compile-form! w)
             (is (wait-for 30 (fn [] (some (fn [p] (= :compile (:source p))) (wb/all-problems w)))))
             (is (some (fn [[_ _ a]] (:underline a)) (ui/text-runs v)))))
+        (testing "the agents' tools ask the program (M3.8 step 3, D-110)"
+          (let [answer (fn [tool args]
+                         (let [got (atom nil)]
+                           (tools/run-tool! w {:name tool :arguments args
+                                               :reply (fn [text error?]
+                                                        (reset! got [text error?]))})
+                           (wait-for 60 (fn [] (some? @got)))
+                           @got))]
+            (is (= ["Output:\nhi\n\nValue:\n5" false]
+                   (answer "skein_eval" {"code" "(println \"hi\")\n(add 2 3)"}))
+                "in the active file's namespace, what it printed and its value")
+            (is (second (answer "skein_eval" {"code" "(add 1 1)" "namespace" "user"}))
+                "the namespace given: add isn't user's")
+            (is (= ["Error: kaboom\nOutput:\n(none)" true] (answer "skein_eval" {"code" "(boom)"}))
+                "an error comes back as an answer")
+            (is (nil? (debugger/current (:debugger w))) "and not in the debugger")
+            (is (second (answer "skein_eval" {"code" "(add 1"}))
+                "code that can't be read is an error")
+            (let [[text error?] (answer "skein_describe" {"symbol" "add"})]
+              (is (not error?))
+              (is (string/includes? text "Adds.") text))
+            (is (string/includes? (ui/code-text (:output w)) "Agent evaluates: (boom)")
+                "the Output panel shows what the agent evaluated")))
         (testing "stopping it"
           (let [p (:process (wb/inferior w))]
             (wb/stop-program! w)

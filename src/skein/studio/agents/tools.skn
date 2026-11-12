@@ -1,0 +1,215 @@
+(ns skein.studio.agents.tools
+  "The IDE's tools for the agents (Skein's M3.8 step 3, D-110), as Lisp Studio has them:
+skein_eval and skein_describe ask the program under skein dev, through its Swank;
+ide_problems, ide_active_file, ide_open_file and repl_transcript ask the workbench.
+Claude Code sees them as mcp__studio__<name>, Codex as dynamic tools. run-tool! answers
+an adapter's :tool-call event, on the UI's thread."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.edn :as edn]
+            [skein.time :as time]
+            [skein.swank.client :as swank]
+            [skein.studio.agents :as agents]
+            [skein.studio.documents :as docs]
+            [skein.studio.inferior :as inferior]
+            [skein.studio.lang :as lang]
+            [skein.studio.workbench :as wb]))
+
+(defn- prop [type description] {"type" type "description" description})
+
+(def tools
+  "The tools, as the adapters take them: {:name :description :schema}."
+  [{:name "skein_eval"
+    :description (str "Evaluate Skein code in the user's running program (under skein dev, "
+                      "through Swank). Returns what it printed and its value; an error is "
+                      "caught and returned. Use it to try code, run tests and look at live "
+                      "state.")
+    :schema (agents/tool-schema
+             {"code" (prop "string" "One or more forms to evaluate.")
+              "namespace" (prop "string" (str "The namespace to evaluate in; by default the "
+                                              "active file's."))}
+             ["code"])}
+   {:name "skein_describe"
+    :description "Describe a var in the running program: its documentation and arguments."
+    :schema (agents/tool-schema
+             {"symbol" (prop "string" "The symbol, optionally namespace-qualified.")
+              "namespace" (prop "string" "The namespace to resolve it in.")}
+             ["symbol"])}
+   {:name "ide_problems"
+    :description (str "List the problems (read errors and compiler notes) in the files the "
+                      "IDE knows.")
+    :schema (agents/tool-schema {} [])}
+   {:name "ide_active_file"
+    :description (str "Describe the file the user has open: its path, language, caret line, "
+                      "namespace, unsaved changes and selected text.")
+    :schema (agents/tool-schema {} [])}
+   {:name "ide_open_file"
+    :description "Open a file in the editor, at a line if given, to show it to the user."
+    :schema (agents/tool-schema
+             {"path" (prop "string" "The path, absolute or relative to the project.")
+              "line" (prop "integer" "The line to show, from 1.")}
+             ["path"])}
+   {:name "repl_transcript"
+    :description "The latest text of the REPL's transcript: what was typed, printed and returned."
+    :schema (agents/tool-schema {} [])}])
+
+(def instructions
+  "What the agents are told of the IDE, besides their own instructions."
+  (str "You are working inside Skein Studio, an IDE for Skein (a Lisp in Clojure's style; "
+       "the project's docs/DESIGN.md, if it has one, describes the language), as the user's "
+       "pair programmer. The project folder is your working directory. Besides your own tools "
+       "you have the IDE's (Claude sees them as mcp__studio__*): skein_eval evaluates code in "
+       "the user's running program and returns its output and value; use it to try code, run "
+       "tests and check what a function returns rather than guessing. skein_describe "
+       "describes a var; ide_problems lists read errors and compiler notes; ide_active_file "
+       "says what the user is looking at; ide_open_file shows a file at a line; "
+       "repl_transcript shows the REPL. When you change a file the editor reloads it; when "
+       "you define functions, evaluate the new definitions with skein_eval too, so the "
+       "running program matches the source. Keep answers concise."))
+
+;;; Answering
+
+(def ^:private eval-error 'skein.studio/agent-error)
+
+(defn wrap-code
+  "code wrapped so an error it signals comes back as a value instead of opening the
+debugger, which would hold the agent's request until the user chose a restart."
+  [code]
+  (str "(try (do\n" code "\n) (catch error e (list '" eval-error
+       " (or (ex-message e) (pr-str e)))))"))
+
+(defn eval-reply
+  "The text of skein_eval's answer from eval-and-grab-output's [output value], and whether
+it is an error."
+  [[output value]]
+  (let [failed (when (string/starts-with? (str value) (str "(" eval-error))
+                 (try (second (edn/read-string value)) (catch error e (str value))))
+        shown (fn [s] (agents/truncate (if (string/blank? s) "(none)" s) 20000))]
+    (if failed
+      [(str "Error: " failed "\nOutput:\n" (shown output)) true]
+      [(str "Output:\n" (shown output) "\nValue:\n" (shown value)) false])))
+
+(def ^:private starting
+  ;; When the tools last started the program, by workbench, so evaluations that come while
+  ;; it starts don't start it again.
+  (atom {}))
+
+(defn- active-ns [w]
+  (when-let [ed (wb/active-editor w)] (wb/file-ns ed)))
+
+(defn- relative [w path]
+  (let [f (wb/folder w)]
+    (if (and f path (string/starts-with? path (str f "/")))
+      (subs path (inc (count f)))
+      path)))
+
+(defn- runnable?
+  "Whether Run Program has something to run: the project's :main or a Skein file."
+  [w]
+  (or (when-let [f (wb/folder w)] (inferior/project-main f))
+      (when-let [ed (wb/active-editor w)] (= "skn" (io/extension (:path (:document ed)))))))
+
+(defn- ask-program!
+  "Call (f conn) on a fiber and reply with what (answer v) gives for its value, or the
+error; without a program, start the project's and say to try again."
+  [w reply f answer]
+  (cond
+    (wb/connected? w)
+    (let [conn (:conn (wb/inferior w))]
+      (future
+        (let [[text error?] (try (answer (f conn))
+                                 (catch error e [(str "Failed: " (or (ex-message e) e)) true]))]
+          (reply text error?))))
+    (not (runnable? w))
+    (reply (str "No program is running, and there's none to start: the folder has no "
+                "project.skn with a :main, and no Skein file is open.")
+           true)
+    :else
+    (let [started (get @starting w)]
+      (when-not (and started (< (- (time/now) started) 120))
+        (swap! starting assoc w (time/now))
+        (wb/run-program! w))
+      (reply (str "The program isn't running yet: Skein Studio is starting it under skein "
+                  "dev. Try again in a few seconds.")
+             true))))
+
+(defn- show-file!
+  "Open the file at path at line (from 1), without taking the keyboard from the user."
+  [w path line]
+  (wb/open-file! w path)
+  (when-let [ed (wb/active-editor w)]
+    (when (and (number? line) (pos? line))
+      (let [v (:view ed)
+            b (:buffer v)
+            p (ui/line-start b (min (dec line) (dec (ui/buffer-line-count b))))]
+        (ui/set-cursor! v p)
+        (ui/scroll-to-position! v p)))))
+
+(defn active-file-text
+  "ide_active_file's answer."
+  [w]
+  (if-let [ed (wb/active-editor w)]
+    (let [d (:document ed)
+          v (:view ed)
+          selection (ui/selected-text v)]
+      (str "Path: " (relative w (:path d))
+           "\nLanguage: " (:name (lang/language-for (:path d)))
+           "\nCaret line: " (inc (ui/position-line (:buffer v) (:cursor v)))
+           (when-let [ns (wb/file-ns ed)] (str "\nNamespace: " ns))
+           "\nUnsaved changes: " (if (docs/modified? d) "yes" "no")
+           (when (seq selection) (str "\nSelection:\n" (agents/truncate selection 8000)))))
+    "No file is open."))
+
+(defn problems-text
+  "ide_problems's answer."
+  [w]
+  (let [ps (wb/all-problems w)]
+    (if (empty? ps)
+      "No problems in the files the IDE knows."
+      (string/join "\n" (map (fn [p] (str (relative w (:file p)) ":" (:line p) ":"
+                                          (inc (or (:column p) 0)) ": " (name (:severity p))
+                                          ": " (:message p)))
+                             ps)))))
+
+(defn run-tool!
+  "Answer an adapter's :tool-call event on the UI's thread: call its :reply with the text
+of the answer and whether it is an error."
+  [w {tool :name arguments :arguments reply :reply}]
+  (let [arg (fn [k] (get arguments k))
+        ok (fn [text] (reply text false))
+        fail (fn [text] (reply text true))
+        opts (if-let [ns (or (arg "namespace") (active-ns w))] {:package ns} {})]
+    (try
+      (case tool
+        "skein_eval"
+        (let [code (str (arg "code"))]
+          (wb/append-output! w (str "Agent evaluates: " (agents/truncate code 300) "\n"))
+          (ask-program! w reply
+                        (fn [conn] (swank/call (swank/eval-and-grab-output
+                                                conn (wrap-code code) opts)
+                                               120))
+                        eval-reply))
+        "skein_describe"
+        (ask-program! w reply
+                      (fn [conn] (swank/call (swank/describe-symbol conn (str (arg "symbol")) opts)
+                                             30))
+                      (fn [text] [(agents/truncate (str text) 20000) false]))
+        "ide_problems" (ok (problems-text w))
+        "ide_active_file" (ok (active-file-text w))
+        "ide_open_file"
+        (let [given (str (arg "path"))
+              path (if (or (io/absolute? given) (nil? (wb/folder w)))
+                     given
+                     (io/path (wb/folder w) given))]
+          (if (io/file? path)
+            (do (show-file! w path (arg "line"))
+                (ok (str "Opened " (relative w path) ".")))
+            (fail (str given " isn't a file."))))
+        "repl_transcript"
+        (let [t (ui/code-text (:transcript (:repl w)))]
+          (ok (if (string/blank? t)
+                "The REPL's transcript is empty."
+                (subs t (max 0 (- (count t) 6000))))))
+        (fail (str "No tool " tool ".")))
+      (catch error e (fail (str "Failed: " (or (ex-message e) e)))))))

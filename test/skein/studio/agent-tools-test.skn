@@ -1,0 +1,94 @@
+(ns skein.studio.agent-tools-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.studio.settings :as settings]
+            [skein.studio.workbench :as wb]
+            [skein.studio.agents.tools :as tools]))
+
+;; The IDE's tools for the agents (Skein's M3.8 step 3, D-110) that ask the workbench, on
+;; the headless backend; program-test asks a real program with skein_eval and
+;; skein_describe.
+
+(use-fixtures :each
+  (fn [t]
+    (ui/use-backend! (headless/backend))
+    (binding [settings/*config-dir* (io/temp-dir "studio-config")]
+      (settings/load-settings!)
+      (t))))
+
+(defn- wait-for [secs done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n (* secs 10)) (done?)
+          :else (do (headless/advance! 0.1) (sleep 0.1) (recur (inc n))))))
+
+(defn- answer [w tool args]
+  (let [got (atom nil)]
+    (tools/run-tool! w {:name tool :arguments args
+                        :reply (fn [text error?] (reset! got [text error?]))})
+    (wait-for 10 (fn [] (some? @got)))
+    @got))
+
+(deftest the-tools
+  (is (= ["skein_eval" "skein_describe" "ide_problems" "ide_active_file" "ide_open_file"
+          "repl_transcript"]
+         (mapv :name tools/tools))
+      "D-110's names")
+  (is (every? (fn [t] (= "object" (get (:schema t) "type"))) tools/tools))
+  (is (= ["code"] (get (:schema (first tools/tools)) "required"))))
+
+(deftest evaluation-replies
+  (is (= ["Output:\nhi\n\nValue:\n3" false] (tools/eval-reply ["hi\n" "3"])))
+  (is (= ["Output:\n(none)\nValue:\nnil" false] (tools/eval-reply ["" "nil"])))
+  (is (= ["Error: kaboom\nOutput:\n(none)" true]
+         (tools/eval-reply ["" "(skein.studio/agent-error \"kaboom\")"])))
+  (is (string/starts-with? (tools/wrap-code "(f)") "(try (do\n(f)\n)")
+      "on lines of its own, so a comment at the end doesn't swallow the rest"))
+
+(deftest the-workbench-tools
+  (let [root (io/temp-dir "studio-tools")
+        w (wb/make-workbench)]
+    (io/make-dirs (io/path root "src/app"))
+    (io/write-file (io/path root "src/app/main.skn")
+                   "(ns app.main)\n\n(defn add [a b]\n  (+ a b))\n")
+    (io/write-file (io/path root "src/app/broken.skn") "(ns app.broken)\n\n(defn f [x\n")
+    (ui/show! (:window w))
+    (wb/open-folder! w root)
+    (testing "no file open"
+      (is (= ["No file is open." false] (answer w "ide_active_file" {}))))
+    (testing "no program, and none to start"
+      (let [[text error?] (answer w "skein_eval" {"code" "1"})]
+        (is error?)
+        (is (string/includes? text "none to start") text)))
+    (testing "opening a file at a line"
+      (is (= ["Opened src/app/main.skn." false]
+             (answer w "ide_open_file" {"path" "src/app/main.skn" "line" 3})))
+      (let [v (:view (wb/active-editor w))]
+        (is (= 2 (ui/position-line (:buffer v) (:cursor v))) "line 3, from 0")))
+    (testing "a file that isn't there"
+      (is (= ["src/nope.skn isn't a file." true]
+             (answer w "ide_open_file" {"path" "src/nope.skn"}))))
+    (testing "the active file"
+      (ui/set-selection! (:view (wb/active-editor w)) 1 3)
+      (is (= [(str "Path: src/app/main.skn\nLanguage: Skein\nCaret line: 1\n"
+                   "Namespace: app.main\nUnsaved changes: no\nSelection:\nns")
+              false]
+             (answer w "ide_active_file" {}))))
+    (testing "problems"
+      (wb/open-file! w (io/path (wb/folder w) "src/app/broken.skn"))
+      (is (wait-for 10 (fn [] (seq (wb/all-problems w)))))
+      (let [[text error?] (answer w "ide_problems" {})]
+        (is (not error?))
+        (is (string/starts-with? text "src/app/broken.skn:") text)
+        (is (string/includes? text ": error: ") text)))
+    (testing "the REPL's transcript"
+      (is (= ["The REPL's transcript is empty." false] (answer w "repl_transcript" {})))
+      (ui/set-buffer-text! (:buffer (:transcript (:repl w))) "user=> (+ 1 2)\n3\n")
+      (is (= ["user=> (+ 1 2)\n3\n" false] (answer w "repl_transcript" {}))))
+    (testing "no such tool"
+      (is (= ["No tool nope." true] (answer w "nope" {}))))
+    (headless/answer! 1 1 1)
+    (ui/close! (:window w))))
