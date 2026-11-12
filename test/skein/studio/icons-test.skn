@@ -1,0 +1,17 @@
+(ns skein.studio.icons-test
+  (:require [skein.test :refer [deftest is use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.studio.icons :as icons]))
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest every-icon
+  ;; Each path is SVG path data skein-ui reads, starting with a move.
+  (doseq [[k path] icons/paths]
+    (let [commands (ui/parse-path-data path)]
+      (is (= :move (first (first commands))) (str k))
+      (is (< 1 (count commands)) (str k))))
+  (is (= 16 (:width (icons/icon :play))))
+  (is (identical? (icons/icon :play) (icons/icon :play)) "made once")
+  (is (= (:vector (icons/icon :file)) (:vector (icons/icon :no-such-icon))) "a file by default"))
