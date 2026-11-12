@@ -1,0 +1,4 @@
+.skein-cache/
+build/
+dist/
+.DS_Store

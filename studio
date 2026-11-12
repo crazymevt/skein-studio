@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start Skein Studio from this checkout (Skein's D-109): ./studio [folder]
+# It opens folder, or the last session. Skein's checkout is ../skein, or $SKEIN_HOME.
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+skein=${SKEIN_HOME:-$here/../skein}
+if [ $# -gt 0 ] && [ -d "$1" ]; then
+  folder=$(cd "$1" && pwd)
+  shift
+  set -- "$folder" "$@"
+fi
+cd "$here"
+exec "$skein/skein" run --release src/skein/studio/main.skn "$@"

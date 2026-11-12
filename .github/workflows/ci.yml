@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Skein Studio's tests run with Skein's and skein-ui's main branches, checked out beside
+# this repository (Skein's D-109): ../skein/skein test runs the project's test/ natively.
+# Windows follows skein-ui's Win32 backend (Skein's M2.16).
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SBCL_VERSION: 2.5.10
+      ZIG_VERSION: 0.17.1
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: skein-studio
+
+      - uses: actions/checkout@v7
+        with:
+          repository: crazymevt/skein
+          path: skein
+
+      - uses: actions/checkout@v7
+        with:
+          repository: crazymevt/skein-ui
+          path: skein-ui
+
+      - name: Install SBCL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sbcl
+
+      - name: Install SBCL (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o sbcl.tar.bz2 \
+            "https://downloads.sourceforge.net/project/sbcl/sbcl/${SBCL_VERSION}/sbcl-${SBCL_VERSION}-x86-64-linux-binary.tar.bz2"
+          tar xjf sbcl.tar.bz2
+          cd "sbcl-${SBCL_VERSION}-x86-64-linux"
+          sudo sh install.sh
+
+      - name: Cache Quicklisp
+        uses: actions/cache@v6
+        with:
+          path: ~/quicklisp
+          key: quicklisp-${{ runner.os }}-v2
+
+      - name: Install Quicklisp
+        run: |
+          if [ ! -f "$HOME/quicklisp/setup.lisp" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/quicklisp.lisp" https://beta.quicklisp.org/quicklisp.lisp
+            sbcl --noinform --no-userinit --non-interactive \
+              --load "$RUNNER_TEMP/quicklisp.lisp" --eval "(quicklisp-quickstart:install)"
+          fi
+
+      # Zig for Skein's runtime: the official release archives, checked against the SHA-256
+      # sums from https://ziglang.org/download/index.json, and cached.
+      - name: Cache Zig
+        id: zig-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig (macOS)
+        if: runner.os == 'macOS' && steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          echo "75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d  $RUNNER_TEMP/zig.tar.xz" \
+            | shasum -a 256 -c -
+          mkdir -p ~/zig && tar xJf "$RUNNER_TEMP/zig.tar.xz" -C ~/zig --strip-components 1
+
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux' && steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  $RUNNER_TEMP/zig.tar.xz" \
+            | sha256sum -c -
+          mkdir -p ~/zig && tar xJf "$RUNNER_TEMP/zig.tar.xz" -C ~/zig --strip-components 1
+
+      - name: Use Zig
+        run: |
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          "$HOME/zig/zig" version
+
+      - name: Bootstrap Skein
+        run: cd skein && make compiler
+
+      - name: Install GTK 4 and Xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Ubuntu's mirrors sometimes fail to resolve: try a few times.
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y libgtk-4-1 libwebkitgtk-6.0-4 xvfb && break
+            sleep 30
+          done
+          dpkg -s libgtk-4-1 > /dev/null
+
+      - name: Run the tests
+        env:
+          # GTK under Xvfb draws without OpenGL.
+          GSK_RENDERER: cairo
+        run: |
+          cd skein-studio
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a ../skein/skein test
+          else
+            ../skein/skein test
+          fi

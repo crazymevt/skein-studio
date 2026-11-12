@@ -1,0 +1,27 @@
+(ns skein.studio.main
+  "Skein Studio's entry point (Skein's D-109): ./studio [folder] [--gtk]. It opens the
+folder, or the last session, on Cocoa on macOS (GTK 4 with --gtk) and GTK 4 elsewhere."
+  (:require [skein.ui :as ui]
+            [skein.ui.cocoa :as cocoa]
+            [skein.ui.gtk :as gtk]
+            [skein.io :as io]
+            [skein.system :as system]
+            [skein.studio.settings :as settings]
+            [skein.studio.workbench :as workbench]))
+
+(defn- backend [args]
+  (if (and (= :macos (system/os)) (not (some #{"--gtk"} args)))
+    (cocoa/backend)
+    (gtk/backend)))
+
+(defn -main [& args]
+  (ui/use-backend! (backend args))
+  (settings/load-settings!)
+  (let [folder (first (remove (fn [a] (string? (re-find #"^--" a))) args))
+        saved (settings/load-session)
+        wb (workbench/make-workbench {:size (:size saved)})]
+    (cond folder (workbench/open-folder! wb folder)
+          (and saved (settings/setting :restore-session)) (workbench/restore-session! wb saved))
+    (ui/on (:window wb) :closed (fn [_] (ui/quit!)))
+    (ui/show! (:window wb))
+    (ui/run!)))

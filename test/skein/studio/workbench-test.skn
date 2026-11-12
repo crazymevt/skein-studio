@@ -1,0 +1,172 @@
+(ns skein.studio.workbench-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.io :as io]
+            [skein.studio.settings :as settings]
+            [skein.studio.themes :as themes]
+            [skein.studio.documents :as docs]
+            [skein.studio.explorer :as explorer]
+            [skein.studio.workbench :as wb]))
+
+;; The workbench (Skein's M3.7 step 1, D-109) on the headless backend, with settings in a
+;; temporary config directory and a small project.
+
+(def ^:dynamic *project* nil)
+
+(defn- project
+  "A temporary project: src/app/main.skn, README.md, a .gitignore and what it ignores."
+  []
+  (let [root (io/temp-dir "studio-project")]
+    (io/make-dirs (io/path root "src/app"))
+    (io/make-dirs (io/path root "build"))
+    (io/write-file (io/path root "src/app/main.skn") "(ns app.main)\n\n(defn -main [] 1)\n")
+    (io/write-file (io/path root "README.md") "# App\n")
+    (io/write-file (io/path root ".gitignore") "build/\n*.log\n")
+    (io/write-file (io/path root "build/out.txt") "x")
+    (io/write-file (io/path root "debug.log") "x")
+    root))
+
+(use-fixtures :each
+  (fn [t]
+    (ui/use-backend! (headless/backend))
+    (binding [settings/*config-dir* (io/temp-dir "studio-config")
+              *project* (project)]
+      (settings/load-settings!)
+      (t))))
+
+(deftest settings-and-the-session
+  (is (= "studio-dark" (settings/setting :theme)))
+  (settings/set-setting! :theme "studio-light")
+  (settings/load-settings!)
+  (is (= "studio-light" (settings/setting :theme)) "kept across a load")
+  (is (= {:theme "studio-light"}
+         (settings/read-data (io/path settings/*config-dir* "settings.edn")))
+      "only what differs from the defaults is saved")
+  (is (nil? (settings/load-session)))
+  (settings/save-session! {:folder "/x" :files ["/x/a"]})
+  (is (= {:folder "/x" :files ["/x/a"]} (settings/load-session)))
+  (io/write-file (io/path settings/*config-dir* "settings.edn") "{:theme")
+  (is (= settings/defaults (settings/load-settings!)) "a file that can't be read is ignored"))
+
+(deftest themes-give-palettes-and-styles
+  (let [dark (themes/find-theme "studio-dark")
+        light (themes/find-theme "studio-light")]
+    (is (= :dark (:appearance dark)))
+    (is (= :light (:appearance (themes/find-theme "studio-light"))))
+    (is (= dark (themes/find-theme "no-such-theme")))
+    (is (= "#1B1B1A" (:content-background (themes/widget-palette dark))))
+    (is (= "#FFFFFF" (:background (themes/editor-palette light))))
+    (is (= {:color "#75756F" :italic true} (:comment (themes/text-styles dark))))
+    (is (= {:color "#8484F0"} (:depth-1 (themes/text-styles dark))))))
+
+(deftest documents
+  (let [path (io/path *project* "src/app/main.skn")
+        d (docs/open-document path)]
+    (is (= "main.skn" (docs/document-name d)))
+    (is (not (docs/modified? d)))
+    (ui/insert-into-buffer! (:buffer d) 0 ";; hi\n")
+    (is (docs/modified? d))
+    (docs/save! d)
+    (is (not (docs/modified? d)))
+    (is (= ";; hi\n(ns app.main)\n\n(defn -main [] 1)\n" (io/read-file path)))
+    (is (not (docs/changed-on-disk? d)))
+    (sleep 0.02)                          ; a later modification time
+    (io/write-file path "(ns app.main)\n")
+    (is (docs/changed-on-disk? d))
+    (docs/reload! d)
+    (is (= "(ns app.main)\n" (ui/buffer-text (:buffer d))))
+    (is (not (docs/modified? d)))
+    (is (ui/can-undo? (:buffer d)) "reloading can be undone")))
+
+(deftest the-explorer-shows-what-git-would
+  (let [ex (explorer/make-explorer *project*)
+        names (fn [dir] (mapv io/file-name (explorer/children ex dir)))]
+    (is (= ["src" ".gitignore" "README.md"] (names *project*))
+        "directories first; build/ and *.log ignored")
+    (is (= ["app"] (names (io/path *project* "src"))))
+    (is (= ["main.skn"] (names (io/path *project* "src/app"))))
+    (is (= [] (explorer/children ex (io/path *project* "README.md"))))))
+
+(deftest the-workbench
+  (let [w (wb/make-workbench {:size [900 600]})
+        main (io/path (io/absolute-path *project*) "src/app/main.skn")
+        readme (io/path (io/absolute-path *project*) "README.md")]
+    (ui/show! (:window w))
+    (testing "a folder"
+      (wb/open-folder! w *project*)
+      (is (= (io/absolute-path *project*) (wb/folder w)))
+      (is (= ["src" ".gitignore" "README.md"] (mapv io/file-name (:roots (:tree w)))))
+      (is (= (str (io/file-name *project*) " — Skein Studio") (:title (:window w)))))
+    (testing "opening files from the explorer"
+      (ui/expand! (:tree w) (io/path (wb/folder w) "src") true)
+      (ui/tree-item-activated-by-user! (:tree w) main)
+      (is (= [main] (mapv (fn [ed] (:path (:document ed))) (wb/editors w))))
+      (is (= "main.skn" (:tab-label (:view (wb/active-editor w)))))
+      (ui/tree-item-activated-by-user! (:tree w) (io/path (wb/folder w) "src"))
+      (is (= 1 (count (wb/editors w))) "a directory opens nothing")
+      (wb/open-file! w readme)
+      (wb/open-file! w main)
+      (is (= 2 (count (wb/editors w))) "an open file's tab is shown again")
+      (is (= main (:path (:document (wb/active-editor w))))))
+    (testing "unsaved changes show in the tab and the title, until saved"
+      (let [ed (wb/active-editor w)]
+        (ui/replace-selection! (:view ed) ";; edited\n")
+        (is (= "main.skn ●" (:tab-label (:view ed))))
+        (is (re-find #"^main.skn ● — " (:title (:window w))))
+        (is (= "Ln 2, Col 1" (:text (:position w))))
+        (wb/save-active! w)
+        (is (= "main.skn" (:tab-label (:view ed))))
+        (is (re-find #"^;; edited\n" (io/read-file main)))))
+    (testing "closing asks about unsaved changes"
+      (let [ed (wb/editor-for w readme)]
+        (ui/insert-into-buffer! (:buffer (:view ed)) 0 "x")
+        (headless/answer! 2)                    ; Cancel
+        (is (not (wb/close-editor! w ed)))
+        (is (= 2 (count (wb/editors w))))
+        (headless/answer! 1)                    ; Don't Save
+        (is (wb/close-editor! w ed))
+        (is (= [main] (mapv (fn [ed] (:path (:document ed))) (wb/editors w))))
+        (is (= "# App\n" (io/read-file readme)) "not saved")
+        (wb/open-file! w readme)
+        (ui/insert-into-buffer! (:buffer (:view (wb/editor-for w readme))) 0 "y")
+        (headless/answer! 0)                    ; Save
+        (is (headless/close-tab! (:tabs w) (:view (wb/editor-for w readme)))
+            "its tab's close button asks too")
+        (is (= "y# App\n" (io/read-file readme)))
+        (is (nil? (wb/editor-for w readme)))))
+    (testing "a file changed on disk"
+      (let [ed (wb/editor-for w main)]
+        (sleep 0.02)
+        (io/write-file main "(ns app.main)\n;; from outside\n")
+        (wb/file-changed! w main)
+        (is (= "(ns app.main)\n;; from outside\n" (ui/buffer-text (:buffer (:view ed))))
+            "an editor without unsaved changes reads it again")
+        (ui/insert-into-buffer! (:buffer (:view ed)) 0 "z")
+        (sleep 0.02)
+        (io/write-file main "again\n")
+        (wb/file-changed! w main)
+        (is (re-find #"^z" (ui/buffer-text (:buffer (:view ed)))) "unsaved changes are kept")
+        (is (re-find #"changed on disk" (:text (:message w))))))
+    (testing "the session"
+      (let [s (wb/session w)]
+        (is (= (wb/folder w) (:folder s)))
+        (is (= [main] (:files s)))
+        (is (= main (:active s)))
+        (is (= [900 600] (:size s)))))
+    (testing "themes"
+      (wb/apply-theme! w "studio-light")
+      (is (= :light (:appearance (:window w))))
+      (is (= "#FFFFFF" (:background (:palette (:view (wb/editor-for w main))))))
+      (is (= "studio-light" (settings/setting :theme))))
+    (testing "quitting asks about unsaved changes"
+      (headless/answer! 2)
+      (is (not (headless/request-close! (:window w))))
+      (headless/answer! 1)
+      (is (headless/request-close! (:window w))))
+    (testing "a session saved when the window closed is restored"
+      (let [w2 (wb/make-workbench)]
+        (wb/restore-session! w2 (settings/load-session))
+        (is (= (wb/folder w) (wb/folder w2)))
+        (is (= [main] (mapv (fn [ed] (:path (:document ed))) (wb/editors w2))))
+        (ui/close! (:window w2))))))

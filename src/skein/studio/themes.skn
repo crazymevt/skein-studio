@@ -1,0 +1,95 @@
+(ns skein.studio.themes
+  "Color themes (Skein's D-109): Lisp Studio's Studio Dark and Studio Light. A theme names
+every color the IDE uses: the window's surfaces, text, accents and status colors, the
+editor's colors, the syntax styles and the colors of brackets by depth. Widgets get them
+through skein-ui palettes, code views as text styles.")
+
+(def ^:private syntax
+  "What each token looks like: a color key of the theme (or a color) and font traits."
+  {:comment [:text-3 {:italic true}]
+   :string [:green]
+   :character [:green]
+   :regex [:green]
+   :number [:amber]
+   :keyword [:purple]
+   :constant [:red]
+   :definer [:accent {:bold true}]
+   :special [:accent]
+   :reader [:amber]
+   :punctuation [:text-2]
+   :error [:red {:underline true}]})
+
+(def themes
+  "The built-in themes, by id."
+  {"studio-dark"
+   {:id "studio-dark" :name "Studio Dark" :appearance :dark
+    :colors {:window "#161616" :sidebar "#161616" :activity "#121212" :status "#141414"
+             :toolbar "#161616" :editor "#1B1B1A" :panel "#1A1A19" :popover "#252524"
+             :surface "#1E1E1D" :surface-2 "#252524" :surface-3 "#2E2E2C"
+             :border "#2A2A28" :border-strong "#3D3D3A"
+             :text "#ECECE8" :text-2 "#A8A8A1" :text-3 "#75756F"
+             :accent "#8484F0" :accent-soft "#26264A" :accent-text "#FFFFFF"
+             :green "#5BC48B" :amber "#E3A64A" :red "#EE7A70" :blue "#6FA2F2" :purple "#B58CF0"
+             :selection "#33335E" :caret "#9C9CF5" :gutter-text "#55554F"
+             :line-highlight "#222221" :match "#3A3A6A" :search-match "#6B5520"}
+    :rainbow [:text-2 "#8484F0" "#5BC48B" "#E3A64A" "#6FA2F2" "#B58CF0"]}
+   "studio-light"
+   {:id "studio-light" :name "Studio Light" :appearance :light
+    :colors {:window "#F7F7F5" :sidebar "#F4F4F1" :activity "#EFEFEB" :status "#F1F1EE"
+             :toolbar "#F7F7F5" :editor "#FFFFFF" :panel "#FBFBFA" :popover "#FFFFFF"
+             :surface "#FFFFFF" :surface-2 "#F1F1EE" :surface-3 "#E9E9E5"
+             :border "#E3E3DE" :border-strong "#D2D2CB"
+             :text "#1C1C1A" :text-2 "#5E5E58" :text-3 "#8E8E86"
+             :accent "#5B5BD6" :accent-soft "#EEEEFC" :accent-text "#FFFFFF"
+             :green "#2F8F5B" :amber "#B7791F" :red "#C8463D" :blue "#2F6FD6" :purple "#8656C9"
+             :selection "#DCDCF8" :caret "#5B5BD6" :gutter-text "#B0B0A8"
+             :line-highlight "#F6F6F3" :match "#D6D6F7" :search-match "#FBE7B5"}
+    :rainbow [:text-2 "#5B5BD6" "#2F8F5B" "#B7791F" "#2F6FD6" "#8656C9"]}})
+
+(defn find-theme
+  "The theme with id, or Studio Dark."
+  [id]
+  (get themes id (get themes "studio-dark")))
+
+(defn color
+  "The theme's color for key (a hex string): one of its colors, or a color key's fallback.
+A string is a color already."
+  [theme key]
+  (if (string? key)
+    key
+    (or (get-in theme [:colors key])
+        (case key
+          (:sidebar :toolbar :status :activity) (color theme :window)
+          (:editor :panel :popover) (color theme :surface)
+          :gutter-text (color theme :text-3)
+          :caret (color theme :accent)
+          "#FF00FF"))))
+
+(defn widget-palette
+  "The skein-ui palette of the theme for the window and everything in it."
+  [theme]
+  (let [c (fn [k] (color theme k))]
+    {:window-background (c :window) :text (c :text) :secondary-text (c :text-2)
+     :disabled-text (c :text-3) :background (c :surface) :control-background (c :surface-2)
+     :content-background (c :editor) :sidebar-background (c :sidebar)
+     :activity-background (c :activity) :status-background (c :status)
+     :toolbar-background (c :toolbar) :popover-background (c :popover) :accent (c :accent)
+     :separator (c :border) :selection (c :selection) :selection-text (c :text)
+     :caret (c :caret) :link (c :blue) :grid (c :border)}))
+
+(defn editor-palette
+  "The skein-ui palette of the theme for a code view."
+  [theme]
+  (let [c (fn [k] (color theme k))]
+    {:background (c :editor) :text (c :text) :selection (c :selection)
+     :selection-text (c :text) :caret (c :caret) :gutter-background (c :editor)
+     :gutter-text (c :gutter-text)}))
+
+(defn text-styles
+  "The theme's syntax styles as a code view's :text-styles: each token style a map of
+:color and font traits; and :depth-0 to :depth-5 for brackets by depth."
+  [theme]
+  (merge (into {} (map (fn [[style [key traits]]] [style (merge {:color (color theme key)} traits)])
+                       syntax))
+         (into {} (map-indexed (fn [i key] [(keyword (str "depth-" i)) {:color (color theme key)}])
+                               (:rainbow theme)))))

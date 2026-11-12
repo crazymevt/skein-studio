@@ -1,0 +1,58 @@
+(ns skein.studio.documents
+  "Documents: files open in editors (Skein's D-109). A document is a file's path and a
+text buffer of its text; it has unsaved changes while the buffer's revision differs from
+the one saved, and notices the file changing on disk by its modification time."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]))
+
+(defclass document []
+  "A file open for editing: :path, :buffer (a text buffer), :saved-revision (the buffer's
+revision when last read or saved) and :disk-time (the file's modification time then)."
+  (path :init nil)
+  (buffer :init nil)
+  (saved-revision :cell :atom :init 0)
+  (disk-time :cell :atom :init nil))
+
+(defn- disk-time [path]
+  (when (io/file-exists? path) (io/modified-time path)))
+
+(defn open-document
+  "A document of the file at path, read now."
+  [path]
+  (let [b (ui/make-text-buffer {:text (io/read-file path)})]
+    (make document :path path :buffer b :saved-revision (:revision b) :disk-time (disk-time path))))
+
+(defn document-name
+  "The document's file name."
+  [d]
+  (io/file-name (:path d)))
+
+(defn modified?
+  "True if the document has changes not saved."
+  [d]
+  (not= (:revision (:buffer d)) (:saved-revision d)))
+
+(defn save!
+  "Write the document's text to its file. Returns the document."
+  [d]
+  (io/write-file (:path d) (ui/buffer-text (:buffer d)))
+  (set-slot! d :saved-revision (:revision (:buffer d)))
+  (set-slot! d :disk-time (disk-time (:path d)))
+  d)
+
+(defn changed-on-disk?
+  "True if the document's file changed (or went) since it was read or saved."
+  [d]
+  (not= (disk-time (:path d)) (:disk-time d)))
+
+(defn reload!
+  "Read the document's file again, as one change undo can take back. Returns the
+document."
+  [d]
+  (let [text (io/read-file (:path d))
+        b (:buffer d)]
+    (when (not= text (ui/buffer-text b))
+      (ui/set-buffer-text! b text))
+    (set-slot! d :saved-revision (:revision b))
+    (set-slot! d :disk-time (disk-time (:path d)))
+    d))

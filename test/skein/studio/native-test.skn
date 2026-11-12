@@ -1,0 +1,48 @@
+(ns skein.studio.native-test
+  (:require [skein.test :refer [deftest is testing]]
+            [skein.ui :as ui]
+            [skein.ui.cocoa :as cocoa]
+            [skein.ui.gtk :as gtk]
+            [skein.io :as io]
+            [skein.system :as system]
+            [skein.studio.settings :as settings]
+            [skein.studio.workbench :as wb]))
+
+;; The workbench on the platforms' own widgets (Skein's M3.7 step 1, D-109): Cocoa on
+;; macOS, GTK where it can open a display. With SKEIN_STUDIO_SNAPSHOTS set to a folder,
+;; each window's picture is kept there.
+
+(defn- exercise [backend run-for! label]
+  (ui/use-backend! backend)
+  (binding [settings/*config-dir* (io/temp-dir "studio-config")]
+    (settings/load-settings!)
+    (let [root (io/temp-dir "studio-native")
+          main (io/path root "src/app/main.skn")
+          w (wb/make-workbench {:size [900 560]})]
+      (io/make-dirs (io/parent main))
+      (io/write-file main "(ns app.main)\n\n(defn -main [& args]\n  (println \"hi\"))\n")
+      (ui/show! (:window w))
+      (wb/open-folder! w root)
+      (ui/expand! (:tree w) (io/path (wb/folder w) "src") true)
+      (let [ed (wb/open-file! w (io/path (wb/folder w) "src/app/main.skn"))]
+        (run-for! 0.3)
+        (is (= 1 (count (wb/editors w))))
+        (ui/insert-into-buffer! (:buffer (:view ed)) 0 ";; native\n")
+        (run-for! 0.1)
+        (is (= "main.skn ●" (:tab-label (:view ed))))
+        (wb/save-active! w)
+        (is (re-find #"^;; native\n" (io/read-file (io/path (wb/folder w) "src/app/main.skn"))))
+        (run-for! 0.3)
+        (let [png (ui/snapshot (:window w))]
+          (is (< 2000 (count png)) "a picture of something")
+          (when-let [dir (system/getenv "SKEIN_STUDIO_SNAPSHOTS")]
+            (io/write-bytes (io/path dir (str "workbench-" label ".png")) png))))
+      (ui/close! (:window w)))))
+
+(deftest on-cocoa
+  (when (= :macos (system/os))
+    (exercise (cocoa/backend) cocoa/run-for! "cocoa")))
+
+(deftest on-gtk
+  (when (gtk/available?)
+    (exercise (gtk/backend) gtk/run-for! "gtk")))

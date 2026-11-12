@@ -1,0 +1,355 @@
+(ns skein.studio.workbench
+  "The window (Skein's D-109): the explorer beside tabs of editors, a status bar and the
+menus. A workbench is a map of the window's widgets and an atom of its state; the
+commands here are what its menus do, and what tests call.
+
+  ┌──────────────┬──────────────────────────────────────────────┐
+  │ explorer     │ editor tabs                                  │
+  │ (the folder) │                                              │
+  ├──────────────┴──────────────────────────────────────────────┤
+  │ status: message ─────────────────────── Ln, Col · language │
+  └─────────────────────────────────────────────────────────────┘"
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.studio.settings :as settings]
+            [skein.studio.themes :as themes]
+            [skein.studio.documents :as docs]
+            [skein.studio.explorer :as explorer]))
+
+;;; State
+
+(defn- state [wb] @(:state wb))
+
+(defn folder
+  "The workbench's folder, or nil."
+  [wb]
+  (:folder (state wb)))
+
+(defn editors
+  "The open editors, in tab order: {:document :view}."
+  [wb]
+  (let [by-view (:editors (state wb))]
+    (vec (keep (fn [page] (get by-view page)) (:children (:tabs wb))))))
+
+(defn active-editor
+  "The editor whose tab shows, or nil."
+  [wb]
+  (when-let [page (ui/selected-page (:tabs wb))]
+    (get (:editors (state wb)) page)))
+
+(defn current-theme [] (themes/find-theme (settings/setting :theme)))
+
+(defn- editor-font []
+  {:family (or (settings/setting :font-family) :monospace) :size (settings/setting :font-size)
+   :weight :regular :italic false})
+
+;;; The title and status bar
+
+(defn- tab-label [ed]
+  (str (docs/document-name (:document ed)) (if (docs/modified? (:document ed)) " ●" "")))
+
+(defn refresh-title!
+  "Show the active document, whether it has unsaved changes, and the folder in the
+window's title."
+  [wb]
+  (let [ed (active-editor wb)
+        f (folder wb)]
+    (set-slot! (:window wb) :title
+               (string/join " — " (remove nil? [(when ed (tab-label ed))
+                                                (when f (io/file-name f))
+                                                "Skein Studio"])))))
+
+(defn refresh-position!
+  "Show where the caret is in the status bar."
+  [wb]
+  (set-slot! (:position wb) :text
+             (if-let [ed (active-editor wb)]
+               (let [v (:view ed)
+                     b (:buffer v)
+                     p (:cursor v)
+                     n (abs (- (:anchor v) p))]
+                 (str "Ln " (inc (ui/position-line b p)) ", Col " (inc (ui/position-column b p))
+                      (if (pos? n) (str " (" n " selected)") "")))
+               "")))
+
+(defn message!
+  "Show text in the status bar."
+  [wb text]
+  (set-slot! (:message wb) :text (str text)))
+
+;;; The session: the folder, the open files and the window's size, saved soon after they
+;;; change.
+
+(defn session
+  "What the workbench would restore: {:folder :files :active :size}."
+  [wb]
+  {:folder (folder wb)
+   :files (mapv (fn [ed] (:path (:document ed))) (editors wb))
+   :active (when-let [ed (active-editor wb)] (:path (:document ed)))
+   :size [(:width (:window wb)) (:height (:window wb))]})
+
+(defn save-session!
+  "Save the session now."
+  [wb]
+  (when-let [t (:session-timer (state wb))] (ui/stop-timer! t))
+  (swap! (:state wb) dissoc :session-timer)
+  (settings/save-session! (session wb)))
+
+(defn- schedule-session-save! [wb]
+  (when-not (:session-timer (state wb))
+    (swap! (:state wb) assoc :session-timer
+           (ui/after 0.5 (fn [] (swap! (:state wb) dissoc :session-timer)
+                           (settings/save-session! (session wb)))))))
+
+;;; Editors
+
+(defn- refresh-editor! [wb ed]
+  (set-slot! (:view ed) :tab-label (tab-label ed))
+  (when (identical? ed (active-editor wb)) (refresh-title! wb)))
+
+(defn- style-view! [v]
+  (let [theme (current-theme)]
+    (set-slot! v :palette (themes/editor-palette theme))
+    (set-slot! v :text-styles (themes/text-styles theme))
+    (set-slot! v :font (editor-font))
+    (set-slot! v :tab-width (settings/setting :tab-width))
+    (set-slot! v :line-numbers (settings/setting :line-numbers))
+    (set-slot! v :wrap (settings/setting :wrap))))
+
+(defn editor-for
+  "The open editor of the file at path, or nil."
+  [wb path]
+  (first (filter (fn [ed] (= path (:path (:document ed)))) (editors wb))))
+
+(defn open-file!
+  "Show the file at path in an editor: its tab if it is open, else a new one. Returns the
+editor."
+  [wb path]
+  (if-let [ed (editor-for wb path)]
+    (do (ui/select-page! (:tabs wb) (:view ed)) ed)
+    (let [d (docs/open-document path)
+          v (ui/code-view {:buffer (:buffer d) :tab-label (docs/document-name d)
+                           :tab-tooltip path})
+          ed {:document d :view v}]
+      (style-view! v)
+      (swap! (:state wb) assoc-in [:editors v] ed)
+      (ui/on (:buffer d) :changed (fn [_] (refresh-editor! wb ed)))
+      (ui/on v :selection-changed (fn [_] (refresh-position! wb)))
+      (ui/add! (:tabs wb) v)
+      (ui/select-page! (:tabs wb) v)
+      (refresh-title! wb)
+      (refresh-position! wb)
+      (schedule-session-save! wb)
+      ed)))
+
+(defn save-editor!
+  "Save the editor's document. Returns the editor."
+  [wb ed]
+  (docs/save! (:document ed))
+  (refresh-editor! wb ed)
+  (message! wb (str "Saved " (docs/document-name (:document ed))))
+  ed)
+
+(defn save-active!
+  "Save the active editor's document."
+  [wb]
+  (when-let [ed (active-editor wb)] (save-editor! wb ed)))
+
+(defn save-all!
+  "Save every document with unsaved changes."
+  [wb]
+  (doseq [ed (editors wb)]
+    (when (docs/modified? (:document ed)) (save-editor! wb ed))))
+
+(defn- may-close?
+  "Ask, if the editor has unsaved changes, whether to save them: true to go on closing
+(saved or discarded), false to keep it open."
+  [wb ed]
+  (if-not (docs/modified? (:document ed))
+    true
+    (case (ui/message-box (str "Save the changes to " (docs/document-name (:document ed)) "?")
+                          {:detail "They are lost if you don't save them."
+                           :type :warning :buttons :save-discard-cancel :parent (:window wb)})
+      :save (do (save-editor! wb ed) true)
+      :discard true
+      false)))
+
+(defn- forget-editor! [wb ed]
+  (swap! (:state wb) update :editors dissoc (:view ed))
+  (refresh-title! wb)
+  (refresh-position! wb)
+  (schedule-session-save! wb))
+
+(defn close-editor!
+  "Close the editor's tab, asking first about unsaved changes (as its close button does).
+Returns true if it closed."
+  [wb ed]
+  (boolean (ui/close-page! (:tabs wb) (:view ed))))
+
+(defn close-active!
+  "Close the active editor."
+  [wb]
+  (when-let [ed (active-editor wb)] (close-editor! wb ed)))
+
+(defn may-quit?
+  "Ask about every document with unsaved changes; true if the window may close."
+  [wb]
+  (every? (fn [ed] (may-close? wb ed)) (editors wb)))
+
+;;; Files changed on disk: an editor without unsaved changes reads its file again; one with
+;;; them says so in the status bar.
+
+(defn file-changed!
+  "The file at path changed on disk: refresh its editor, if it has one, and the explorer."
+  [wb path]
+  (when-let [ed (editor-for wb path)]
+    (let [d (:document ed)]
+      (when (and (io/file-exists? path) (docs/changed-on-disk? d))
+        (if (docs/modified? d)
+          (message! wb (str (docs/document-name d) " changed on disk; it has unsaved changes"))
+          (do (docs/reload! d)
+              (refresh-editor! wb ed)
+              (message! wb (str "Reloaded " (docs/document-name d))))))))
+  (when-let [t (:tree wb)]
+    (let [dir (io/parent path)]
+      (if (and dir (ui/expanded? t dir)) (ui/refresh-tree! t dir) (ui/refresh-tree! t)))))
+
+(defn- stop-watching! [wb]
+  (when-let [w (:watcher (state wb))]
+    (io/stop-watch! w)
+    (swap! (:state wb) dissoc :watcher)))
+
+(defn- watch-folder! [wb root]
+  (stop-watching! wb)
+  (let [w (io/watch root)]
+    (swap! (:state wb) assoc :watcher w)
+    (future
+      (loop []
+        (when-let [e (<! (:events w))]
+          ;; On the UI's thread, in turn with its events.
+          (ui/after 0 (fn [] (file-changed! wb (:path e))))
+          (recur))))))
+
+;;; The folder
+
+(defn open-folder!
+  "Show the folder at root in the explorer, and watch it."
+  [wb root]
+  (let [root (io/absolute-path root)
+        ex (explorer/make-explorer root)
+        t (:tree wb)]
+    (swap! (:state wb) assoc :folder root :explorer ex)
+    (set-slot! t :children-fn (fn [p] (explorer/children ex p)))
+    (set-slot! t :roots (explorer/children ex root))
+    (watch-folder! wb root)
+    (refresh-title! wb)
+    (schedule-session-save! wb)
+    root))
+
+(defn choose-folder!
+  "Ask for a folder and open it."
+  [wb]
+  (when-let [dir (ui/choose-directory {:title "Open Folder" :parent (:window wb)})]
+    (open-folder! wb dir)))
+
+(defn choose-file!
+  "Ask for a file and open it."
+  [wb]
+  (when-let [f (ui/choose-file {:title "Open File" :parent (:window wb)
+                                :directory (folder wb)})]
+    (open-file! wb f)))
+
+;;; Themes
+
+(defn apply-theme!
+  "Use the theme with id, and remember it."
+  [wb id]
+  (settings/set-setting! :theme id)
+  (let [theme (current-theme)]
+    (set-slot! (:window wb) :appearance (:appearance theme))
+    (set-slot! (:window wb) :palette (themes/widget-palette theme))
+    (doseq [ed (editors wb)] (style-view! (:view ed)))))
+
+;;; Menus
+
+(defn- item [label shortcut f]
+  (ui/menu-item (merge {:label label :on-activate (fn [_] (f))}
+                       (when shortcut {:shortcut shortcut}))))
+
+(defn- menus [wb]
+  (ui/menu-bar {}
+    (ui/menu {:title "File"}
+      (item "Open Folder…" "Primary+Shift+O" (fn [] (choose-folder! wb)))
+      (item "Open File…" "Primary+O" (fn [] (choose-file! wb)))
+      (ui/menu-separator)
+      (item "Save" "Primary+S" (fn [] (save-active! wb)))
+      (item "Save All" "Primary+Alt+S" (fn [] (save-all! wb)))
+      (ui/menu-separator)
+      (item "Close Tab" "Primary+W" (fn [] (close-active! wb)))
+      (ui/menu-item {:role :quit}))
+    (ui/menu {:title "Edit"}
+      (ui/menu-item {:role :undo}) (ui/menu-item {:role :redo}) (ui/menu-separator)
+      (ui/menu-item {:role :cut}) (ui/menu-item {:role :copy}) (ui/menu-item {:role :paste})
+      (ui/menu-item {:role :select-all}))
+    (ui/menu {:title "View"}
+      (item "Studio Dark" nil (fn [] (apply-theme! wb "studio-dark")))
+      (item "Studio Light" nil (fn [] (apply-theme! wb "studio-light"))))))
+
+;;; The window
+
+(defn make-workbench
+  "A workbench: its window with the explorer, the editors' tabs and a status bar, not yet
+shown. opts: :size [width height]."
+  ([] (make-workbench {}))
+  ([opts]
+   (let [theme (current-theme)
+         [width height] (or (:size opts) [1100 720])
+         st (atom {:editors {}})
+         wb-ref (atom nil)
+         tree (ui/tree-view {:roots [] :item-label io/file-name :children-fn (fn [_] [])
+                             :on-row-activated (fn [e]
+                                                 (let [p (:item e)]
+                                                   (when (io/file? p)
+                                                     (open-file! @wb-ref p))))})
+         tabs (ui/tabbed-pane {:vexpand true :hexpand true})
+         message (ui/label {:text "" :text-color :secondary-text :hexpand true})
+         position (ui/label {:text "" :text-color :secondary-text})
+         window (ui/window {:title "Skein Studio" :width width :height height
+                            :appearance (:appearance theme)
+                            :palette (themes/widget-palette theme)}
+                  (ui/vbox {}
+                    (ui/paned {:position 240 :vexpand true}
+                              (ui/scrolled-window {} tree)
+                              tabs)
+                    (ui/hbox {:padding [3 10] :spacing 12 :surface :status}
+                             message position)))
+         wb {:window window :tree tree :tabs tabs :message message :position position
+             :state st}]
+     (reset! wb-ref wb)
+     (set-slot! window :menu-bar (menus wb))
+     ;; Closing a tab asks about unsaved changes first; a closed one is forgotten.
+     (ui/on tabs :page-close-request
+            (fn [e]
+              (when-let [ed (get (:editors @st) (:value e))]
+                (when-not (may-close? wb ed) (ui/veto e)))))
+     (ui/on tabs :page-closed
+            (fn [e]
+              (when-let [ed (get (:editors @st) (:value e))]
+                (forget-editor! wb ed))))
+     (ui/on tabs :page-changed (fn [_] (refresh-title! wb) (refresh-position! wb)
+                                 (schedule-session-save! wb)))
+     (ui/on window :close-request (fn [e] (when-not (may-quit? wb) (ui/veto e))))
+     (ui/on window :resize (fn [_] (schedule-session-save! wb)))
+     (ui/on window :closed (fn [_] (stop-watching! wb) (save-session! wb)))
+     wb)))
+
+(defn restore-session!
+  "Open the saved session's folder and files, those that still exist."
+  [wb s]
+  (when-let [f (:folder s)]
+    (when (io/directory? f) (open-folder! wb f)))
+  (doseq [p (:files s)]
+    (when (io/file? p) (open-file! wb p)))
+  (when-let [p (:active s)]
+    (when (editor-for wb p) (open-file! wb p))))

@@ -1,0 +1,79 @@
+(ns skein.studio.settings
+  "Settings and the saved session, as EDN files in Skein Studio's config directory
+(Skein's D-109). A settings file holds only what differs from the defaults; a file that
+can't be read leaves the defaults."
+  (:require [skein.io :as io]
+            [skein.edn :as edn]
+            [skein.system :as system]))
+
+(def app-name "The application's name, for its directories." "Skein Studio")
+
+(def defaults
+  "Every setting and its default."
+  {:theme "studio-dark"
+   :font-family nil            ; nil: the platform's monospace font
+   :font-size 13
+   :tab-width 2
+   :line-numbers true
+   :wrap false
+   :restore-session true
+   :ignored-names #{".DS_Store" ".skein-cache"}})
+
+(def ^:dynamic *config-dir*
+  "Where settings and the session are kept: Skein Studio's config directory, or another
+for tests."
+  nil)
+
+(defn config-dir []
+  (or *config-dir* (system/config-dir app-name)))
+
+(defn- path-of [name] (io/path (config-dir) name))
+
+(defn read-data
+  "The EDN value in the file at path, or nil if it is missing or can't be read."
+  [path]
+  (when (io/file-exists? path)
+    (try (edn/read-string (io/read-file path))
+         (catch error e nil))))
+
+(defn write-data!
+  "Write value to the file at path as EDN, making its directory, and keep it to its owner."
+  [path value]
+  (io/make-dirs (io/parent path))
+  (io/write-file path (str (pr-str value) "\n"))
+  (io/owner-only! path)
+  value)
+
+(def settings
+  "The current settings: the defaults merged with the settings file."
+  (atom defaults))
+
+(defn load-settings!
+  "Read the settings file over the defaults. Returns the settings."
+  []
+  (let [saved (read-data (path-of "settings.edn"))]
+    (reset! settings (merge defaults (when (map? saved) saved)))))
+
+(defn setting
+  "The current value of the setting k."
+  [k]
+  (get @settings k))
+
+(defn set-setting!
+  "Change the setting k to v and save the settings that differ from the defaults."
+  [k v]
+  (swap! settings assoc k v)
+  (write-data! (path-of "settings.edn")
+               (into {} (remove (fn [[k v]] (= v (get defaults k))) @settings)))
+  v)
+
+(defn load-session
+  "The saved session, {:folder :files :active :size}, or nil."
+  []
+  (let [s (read-data (path-of "session.edn"))]
+    (when (map? s) s)))
+
+(defn save-session!
+  "Save the session."
+  [session]
+  (write-data! (path-of "session.edn") session))

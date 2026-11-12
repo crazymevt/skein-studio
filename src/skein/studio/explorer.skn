@@ -1,0 +1,27 @@
+(ns skein.studio.explorer
+  "The explorer's model (Skein's D-109): a project folder's files as Git sees them, a
+directory at a time, directories first. What Git's ignore rules ignore, .git and the
+names the settings ignore don't show; other dot files do."
+  (:require [skein.io :as io]
+            [skein.string :as string]
+            [skein.studio.settings :as settings]))
+
+(defn make-explorer
+  "An explorer of the folder at root."
+  [root]
+  {:root root :matcher (io/ignore-matcher root)})
+
+(defn children
+  "The paths in the directory dir of the explorer, directories first, each by name."
+  [ex dir]
+  (if-not (io/directory? dir)
+    []
+    (let [skip (settings/setting :ignored-names)
+          entries (keep (fn [name]
+                          (let [p (io/path dir name)
+                                d (io/directory? p)]
+                            (when-not (or (= name ".git") (contains? skip name)
+                                          (io/ignored? (:matcher ex) p d))
+                              [(if d 0 1) (string/lower-case name) p])))
+                        (io/list-dir dir))]
+      (mapv (fn [[_ _ p]] p) (sort entries)))))
