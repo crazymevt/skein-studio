@@ -1333,7 +1333,7 @@ shown. opts: :size [width height]."
                                          :back (late inspector-actions :back)})
          problems-list (ui/list-box {:items [] :vexpand true})
          ;; the right side, which a panel made outside the workbench fills (set-right-panel!)
-         right (ui/vbox {:visible false :width 420 :hexpand false})
+         right (ui/vbox {:visible false :hexpand false})
          ;; The program's state, in the toolbar, over the REPL and in the status bar
          views [(program-view {}) (program-view {:font {:size 12}})
                 (program-view {:text-color :secondary-text})]
@@ -1413,7 +1413,9 @@ shown. opts: :size [width height]."
                       (ui/separator {:orientation :vertical})
                       (ui/paned {:position 240 :vexpand true :hexpand true}
                                 explorer-pane
-                                (ui/hbox {:spacing 1}
+                                ;; the agent's side keeps its width as the window's
+                                ;; changes, and the user drags it
+                                (ui/paned {:keep :end :position 420 :hexpand true}
                                   (ui/paned {:orientation :vertical :position (- height 300)
                                              :hexpand true}
                                             (ui/vbox {} find-bar editor-area) panels)
