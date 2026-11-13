@@ -45,7 +45,8 @@
  [:agent "codex" "test/agents/codex-turn.edn"]
  [:wait :agent-idle 60]
  [:agent-send "hi"]
- [:wait :agent-text "Hel" 30]
+ ;; Codex's own reply under way (Claude's "Hello" is in the chat already)
+ [:wait :agent-text "Codex\nHel" 30]
  [:agent-send "and briefly"]
  [:wait :agent-request 30]
  [:agent-click "Allow for session"]

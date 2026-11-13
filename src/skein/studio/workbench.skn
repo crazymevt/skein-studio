@@ -29,6 +29,7 @@ commands here are what its menus do, and what tests call.
             [skein.studio.palette :as palette]
             [skein.studio.search :as search]
             [skein.process :as process]
+            [skein.studio.icons :as icons]
             [skein.swank.client :as swank]))
 
 ;;; State
@@ -37,12 +38,15 @@ commands here are what its menus do, and what tests call.
 
 (defn later!
   "Call f on the UI's thread seconds from now (0: as soon as it can), unless the backend
-the workbench was made with is no longer the one in use: its widgets belong to that
-backend, and a test may have gone on to another. Returns the timer, or nil."
+the workbench was made with is no longer the one in use (its widgets belong to that
+backend, and a test may have gone on to another) or its window has closed. Returns the
+timer, or nil."
   [wb seconds f]
-  (let [ours (fn [] (identical? (:backend wb) (ui/current-backend)))]
+  (let [ours (fn [] (and (identical? (:backend wb) (ui/current-backend))
+                         (not (:closed @(:state wb)))))]
     ;; and again when it fires: GTK on macOS runs on AppKit's run loop, where a Cocoa
-    ;; workbench's timer can fire after a test has gone on to GTK
+    ;; workbench's timer can fire after a test has gone on to GTK; and what happens after
+    ;; the window closed (an agent's CLI ending) has no widgets to show in
     (when (ours)
       (ui/after seconds (fn [] (when (ours) (f)))))))
 
@@ -77,6 +81,20 @@ panes has an editor (a view) in each."
 (defn- activate-pane! [wb pane]
   (swap! (:state wb) assoc :active-pane pane))
 
+(defn file-icon
+  "The icon of the file (or folder) at path, size points: a folder in the accent's color,
+a Skein file a λ, EDN braces, Markdown a book, the rest a file."
+  ([path] (file-icon path 16))
+  ([path size]
+   (if (io/directory? path)
+     (icons/icon :folder {:size size :color :accent})
+     (case (io/extension path)
+       ("skn" "clj" "cljc" "lisp") (icons/icon :lambda {:size size :color :system-purple})
+       "edn" (icons/icon :braces {:size size :color :system-orange})
+       "md" (icons/icon :book {:size size :color :system-teal})
+       ("png" "jpg" "jpeg" "gif") (icons/icon :image {:size size})
+       (icons/icon :file {:size size})))))
+
 (defn current-theme [] (themes/find-theme (settings/setting :theme)))
 
 (defn- editor-font []
@@ -90,18 +108,33 @@ panes has an editor (a view) in each."
 
 (defn refresh-title!
   "Show the active document, whether it has unsaved changes, and the folder in the
-window's title."
+window's title, and the folder in the toolbar and the explorer's header."
   [wb]
   (let [ed (active-editor wb)
         f (folder wb)]
+    (set-slot! (:project-label wb) :text (if f (io/file-name f) "No folder"))
+    (set-slot! (:explorer-title wb) :text (string/upper-case (if f (io/file-name f) "Explorer")))
     (set-slot! (:window wb) :title
                (string/join " — " (remove nil? [(when ed (tab-label ed))
                                                 (when f (io/file-name f))
                                                 "Skein Studio"])))))
 
+(def refresh-status!
+  "Show the active editor's namespace and language, and the problems, in the status bar
+(defined with the chrome, below).")
+
+(def refresh-program-state!
+  "Show the program's state in the toolbar, the REPL's header and the status bar
+(defined with the chrome, below).")
+
 (defn refresh-position!
-  "Show where the caret is in the status bar."
+  "Show where the caret is in the status bar (and, when another editor is active, the
+rest of what it says of the editor)."
   [wb]
+  (let [ed (active-editor wb)]
+    (when-not (identical? ed (:status-editor (state wb)))
+      (swap! (:state wb) assoc :status-editor ed)
+      (refresh-status! wb)))
   (set-slot! (:position wb) :text
              (if-let [ed (active-editor wb)]
                (let [v (:view ed)
@@ -181,7 +214,7 @@ window's title."
   (let [path (:path d)
         l (lang/language-for path)
           v (editor/make-view (:buffer d) l {:tab-label (docs/document-name d)
-                                            :tab-tooltip path})
+                                            :tab-tooltip path :tab-icon (file-icon path 14)})
           ed {:document d :view v}]
       (style-view! v)
       (when (seq (:extensions l))
@@ -385,10 +418,12 @@ Returns true if it closed."
     (ui/scroll-to-position! v (ui/buffer-length b))))
 
 (defn show-panel!
-  "Show the panel page in the panels below the editors."
+  "Show the panel page (or the page a widget is in) in the panels below the editors."
   [wb page]
   (let [n (:panels wb)
-        i (first (keep-indexed (fn [i c] (when (identical? c page) i)) (:children n)))]
+        in? (fn [c] (loop [w page] (cond (nil? w) false (identical? w c) true
+                                         :else (recur (:parent w)))))
+        i (first (keep-indexed (fn [i c] (when (in? c) i)) (:children n)))]
     (when i (set-slot! n :selected-index i))))
 
 (def ^:private goto-location!
@@ -399,10 +434,12 @@ Returns true if it closed."
   [wb e]
   (case (:event e)
     :output (repl/append! (:repl wb) (:text e))
-    :new-package (repl/set-prompt! (:repl wb) (str (:prompt e) "=> "))
+    :new-package (do (repl/set-prompt! (:repl wb) (str (:prompt e) "=> "))
+                     (refresh-program-state! wb))
     ;; Only one the user didn't ask for: Stop Program has forgotten the program already.
     :disconnected (when (inferior wb)
                     (swap! (:state wb) dissoc :inferior)
+                    (refresh-program-state! wb)
                     (message! wb (str "The program's Swank disconnected: " (:reason e))))
     :debug (do (debugger/debug! (:debugger wb) e)
                (show-panel! wb (:widget (:debugger wb)))
@@ -422,7 +459,8 @@ start stays."
     (when-let [p (some-> (:starting old) deref)]
       (when (process/alive? p) (process/destroy-tree! p)))
     (when (or (:inferior old) (:starting old))
-      (message! wb "Stopped"))))
+      (message! wb "Stopped")
+      (refresh-program-state! wb))))
 
 (defn stop-program!
   "Stop talking to the program, and stop it if the workbench started it, also while it's
@@ -433,6 +471,7 @@ still starting."
 
 (defn- running! [wb inf what]
   (swap! (:state wb) assoc :inferior inf)
+  (refresh-program-state! wb)
   (repl/set-prompt! (:repl wb) (str @(:package (:conn inf)) "=> "))
   (message! wb what)
   ;; what was typed at the REPL while it started
@@ -450,6 +489,7 @@ to it; label names it in the status bar."
   (let [starting (atom nil)
         current? (fn [] (identical? starting (:starting @(:state wb))))]
     (swap! (:state wb) assoc :starting starting)
+    (refresh-program-state! wb)
     (message! wb (str "Starting " label " under skein dev…"))
     (async! wb (fn [] (inferior/start! folder main
                                        (fn [line] (on-ui wb append-output! (str line "\n")))
@@ -467,6 +507,7 @@ to it; label names it in the status bar."
                 (:value r) (do (swap! (:state wb) dissoc :starting)
                                (running! wb (:value r) (str "Running " label)))
                 :else (do (swap! (:state wb) dissoc :starting :repl-pending)
+                          (refresh-program-state! wb)
                           (message! wb (str "Couldn't run " label ": "
                                             (reason (:error r))))))))))
 
@@ -734,7 +775,8 @@ caret there. Returns the editor, or nil."
       (when-let [hl (:highlighter (:view ed))]
         (highlight/set-problems! hl (mapv (fn [p] (problem-range ed p))
                                           (filter (fn [p] (= (:file p) (:path (:document ed))))
-                                                  ps)))))))
+                                                  ps)))))
+    (refresh-status! wb)))
 
 (defn- set-problems-of! [wb path source ps]
   (swap! (:state wb) assoc-in [:problems path source] (vec ps))
@@ -1133,6 +1175,93 @@ menus, as a panel made outside it does."
 
 ;;; The window
 
+;;; The chrome (Skein's M3.9 step 5, D-115): the toolbar, the activity bar, the
+;;; explorer's header, the panels' tabs, the REPL's header and the status bar.
+
+(defn- icon-button [k tip f]
+  (ui/button {:image (icons/icon k) :style :icon :tooltip tip :on-clicked (fn [_] (f))}))
+
+(defn- tool-button [k label tip f]
+  (ui/button {:image (icons/icon k) :label label :style :flat :tooltip tip
+              :on-clicked (fn [_] (f))}))
+
+(defn program-state
+  "The program's state: [:running \"Skein · user\"] (and its namespace), [:starting
+\"Starting…\"] or [:none \"No program\"]."
+  [wb]
+  (let [s (state wb)]
+    (cond (connected? wb) [:running (str "Skein · " @(:package (:conn (:inferior s))))]
+          (:starting s) [:starting "Starting…"]
+          :else [:none "No program"])))
+
+(def ^:private state-colors
+  {:running :system-green :starting :system-orange :none :secondary-text})
+
+(defn- program-view
+  "A dot and a label showing the program's state: {:widget :color :dot :label}."
+  [opts]
+  (let [color (atom :secondary-text)
+        dot (ui/canvas {:width 8 :height 8 :hexpand false :vexpand false :valign :center
+                        :focusable false
+                        :on-draw (fn [e] (ui/fill-circle! (:context e) 4 4 4 {:color @color}))})
+        label (ui/label (merge {:text "No program" :valign :center} opts))]
+    {:widget (ui/hbox {:spacing 6} dot label) :color color :dot dot :label label}))
+
+(defn refresh-program-state!
+  "Show the program's state in the toolbar, the REPL's header and the status bar."
+  [wb]
+  (when-not (:destroyed (:window wb))
+    (let [[k text] (program-state wb)]
+      (doseq [v (:program-views wb)]
+        (reset! (:color v) (get state-colors k))
+        (ui/redraw! (:dot v))
+        (set-slot! (:label v) :text text)))))
+
+(defn refresh-status!
+  "Show the active editor's namespace and language, and the problems, in the status bar."
+  [wb]
+  (let [ed (active-editor wb)
+        ps (all-problems wb)
+        errors (count (filter (fn [p] (= :error (:severity p))) ps))
+        others (- (count ps) errors)]
+    (set-slot! (:problems-icon wb) :image
+               (if (empty? ps)
+                 (icons/icon :check {:size 12 :color :system-green})
+                 (icons/icon :problems {:size 12 :color (if (pos? errors) :system-red
+                                                            :system-orange)})))
+    (set-slot! (:problems-label wb) :text (str errors " · " others))
+    (set-slot! (:ns-label wb) :text (or (when ed (file-ns ed)) ""))
+    (set-slot! (:language-label wb) :text
+               (if ed (:name (lang/language-for (:path (:document ed)))) ""))
+    (set-slot! (:encoding-label wb) :text (if ed "LF · UTF-8" ""))))
+
+(defn run-command!
+  "Run the workbench's command titled title (one a panel added, say); false if there is
+none."
+  [wb title]
+  (if-let [c (first (filter (fn [c] (= title (:title c))) (commands wb)))]
+    (do ((:run c)) true)
+    false))
+
+(defn- activity-button
+  "A button of the activity bar: an icon, which a click runs f for."
+  [k tip f]
+  (ui/vbox {:clickable true :padding 7 :corner-radius 7 :hover-background [:text 0.08]
+            :tooltip tip :user-data {:label tip} :on-clicked (fn [_] (f))}
+           (ui/image-view {:image (icons/icon k {:size 20 :color :secondary-text})
+                           :hexpand false :vexpand false})))
+
+(defn show-explorer!
+  "Show the explorer on the left, or with shown false hide it."
+  ([wb] (show-explorer! wb true))
+  ([wb shown] (set-slot! (:explorer-pane wb) :visible (boolean shown))))
+
+(defn refresh-explorer!
+  "Read the folder's files again."
+  [wb]
+  (when-let [ex (:explorer (state wb))]
+    (set-slot! (:tree wb) :roots (explorer/children ex (:root ex)))))
+
 (defn make-workbench
   "A workbench: its window with the explorer, the editors' tabs and a status bar, not yet
 shown. opts: :size [width height]."
@@ -1143,6 +1272,7 @@ shown. opts: :size [width height]."
          st (atom {:editors {} :panes []})
          wb-ref (atom nil)
          tree (ui/tree-view {:roots [] :item-label io/file-name :children-fn (fn [_] [])
+                             :icon-fn (fn [p] (file-icon p))
                              :on-row-activated (fn [e]
                                                  (let [p (:item e)]
                                                    (when (io/file? p)
@@ -1201,26 +1331,98 @@ shown. opts: :size [width height]."
                                   :eval (late debugger-actions :eval)}))
          insp (inspector/make-inspector {:part (late inspector-actions :part)
                                          :back (late inspector-actions :back)})
-         problems-list (ui/list-box {:items [] :vexpand true :tab-label "Problems"})
+         problems-list (ui/list-box {:items [] :vexpand true})
          ;; the right side, which a panel made outside the workbench fills (set-right-panel!)
          right (ui/vbox {:visible false :width 420 :hexpand false})
-         panels (ui/notebook {} (doto (:widget repl-panel) (set-slot! :tab-label "REPL")) output
-                             (doto (:widget dbg) (set-slot! :tab-label "Debugger"))
-                             (doto (:widget insp) (set-slot! :tab-label "Inspector"))
-                             problems-list search-panel)
+         ;; The program's state, in the toolbar, over the REPL and in the status bar
+         views [(program-view {}) (program-view {:font {:size 12}})
+                (program-view {:text-color :secondary-text})]
+         later-wb (fn [f] (fn [] (when-let [w @wb-ref] (f w))))
+         repl-page (ui/vbox {}
+                     (ui/hbox {:padding [3 8 3 12] :spacing 4}
+                              (:widget (nth views 1)) (ui/box {:hexpand true})
+                              (icon-button :play "Start a REPL" (later-wb start-repl!))
+                              (icon-button :stop "Stop the program" (later-wb stop-program!))
+                              (icon-button :clear "Clear the REPL"
+                                           (fn [] (ui/set-buffer-text!
+                                                   (:buffer (:transcript repl-panel)) ""))))
+                     (ui/separator {})
+                     (:widget repl-panel))
+         page (fn [w label k] (doto w (set-slot! :tab-label label) (set-slot! :tab-closable false)
+                                (set-slot! :tab-icon (icons/icon k {:size 14}))))
+         panels (ui/tabbed-pane {:reorderable false}
+                                (page repl-page "REPL" :repl) (page output "Output" :outline)
+                                (page (:widget dbg) "Debugger" :debugger)
+                                (page (:widget insp) "Inspector" :inspector)
+                                (page problems-list "Problems" :problems)
+                                (page search-panel "Search" :search))
+         project-label (ui/label {:text "No folder" :valign :center
+                                  :font {:weight :semibold}})
+         toolbar (ui/hbox {:padding [4 10] :spacing 6 :surface :toolbar}
+                          (ui/image-view {:image (icons/icon :project {:size 16 :color :accent})
+                                          :hexpand false :vexpand false})
+                          project-label (ui/box {:hexpand true})
+                          (:widget (nth views 0))
+                          (tool-button :play "Run" "Run the project (Primary+R)"
+                                       (later-wb run-program!))
+                          (icon-button :stop "Stop the program" (later-wb stop-program!))
+                          (tool-button :repl "REPL" "Start a REPL with no program"
+                                       (later-wb start-repl!))
+                          (ui/separator {:orientation :vertical})
+                          (icon-button :search "Find in files" (later-wb show-search!))
+                          (tool-button :sparkle "Agent" "Show the agent (Primary+J)"
+                                       (later-wb (fn [w] (run-command! w "Agent")))))
+         explorer-title (ui/label {:text "EXPLORER" :hexpand true :valign :center
+                                   :font {:size 11 :weight :semibold}
+                                   :text-color :secondary-text})
+         explorer-pane (ui/vbox {}
+                         (ui/hbox {:padding [4 6 4 12] :spacing 2}
+                                  explorer-title
+                                  (icon-button :folder "Open a folder" (later-wb choose-folder!))
+                                  (icon-button :refresh "Read the folder again"
+                                               (later-wb refresh-explorer!)))
+                         (ui/scrolled-window {:vexpand true} tree))
+         activity (ui/vbox {:padding [8 6] :spacing 4 :surface :sidebar}
+                           (activity-button :files "Explorer"
+                                            (later-wb (fn [w] (show-explorer!
+                                                               w (not (:visible
+                                                                       (:explorer-pane w)))))))
+                           (activity-button :search "Search" (later-wb show-search!))
+                           (activity-button :problems "Problems"
+                                            (later-wb (fn [w] (show-panel! w (:problems-list w)))))
+                           (activity-button :repl "REPL"
+                                            (later-wb (fn [w] (show-panel! w (:widget (:repl w))))))
+                           (ui/box {:vexpand true})
+                           (activity-button :sparkle "Agent"
+                                            (later-wb (fn [w] (run-command! w "Agent")))))
+         problems-icon (ui/image-view {:image (icons/icon :check {:size 12}) :hexpand false
+                                       :vexpand false :valign :center})
+         status-label (fn [] (ui/label {:text "" :text-color :secondary-text :valign :center}))
+         problems-label (status-label)
+         ns-label (status-label)
+         encoding-label (status-label)
+         language-label (status-label)
          window (ui/window {:title "Skein Studio" :width width :height height
                             :appearance (:appearance theme)
                             :palette (themes/widget-palette theme)}
                   (ui/vbox {}
-                    (ui/paned {:position 240 :vexpand true}
-                              (ui/scrolled-window {} tree)
-                              (ui/hbox {:spacing 1}
-                                (ui/paned {:orientation :vertical :position (- height 300)
-                                           :hexpand true}
-                                          (ui/vbox {} find-bar editor-area) panels)
-                                right))
-                    (ui/hbox {:padding [3 10] :spacing 12 :surface :status}
-                             message hint position)))
+                    toolbar
+                    (ui/separator {})
+                    (ui/hbox {:vexpand true :spacing 0}
+                      activity
+                      (ui/separator {:orientation :vertical})
+                      (ui/paned {:position 240 :vexpand true :hexpand true}
+                                explorer-pane
+                                (ui/hbox {:spacing 1}
+                                  (ui/paned {:orientation :vertical :position (- height 300)
+                                             :hexpand true}
+                                            (ui/vbox {} find-bar editor-area) panels)
+                                  right)))
+                    (ui/hbox {:padding [3 10] :spacing 14 :surface :status}
+                             message hint
+                             (ui/hbox {:spacing 4} problems-icon problems-label)
+                             position ns-label encoding-label language-label
+                             (:widget (nth views 2)))))
          wb {:window window :tree tree :tabs tabs :editor-area editor-area :palette pal
              :find-bar find-bar :find-entry find-entry :replace-entry replace-entry
              :find-regex find-regex :find-case find-case :find-count find-count
@@ -1229,8 +1431,15 @@ shown. opts: :size [width height]."
              :message message :position position
              :hint hint :output output :repl repl-panel :popup popup :state st
              :debugger dbg :inspector insp :problems-list problems-list :panels panels
-             :right right :backend (ui/current-backend)}]
+             :right right :backend (ui/current-backend)
+             :project-label project-label :explorer-title explorer-title
+             :explorer-pane explorer-pane :problems-icon problems-icon
+             :problems-label problems-label :ns-label ns-label :encoding-label encoding-label
+             :language-label language-label :program-views views}]
      (reset! wb-ref wb)
+     (refresh-program-state! wb)
+     (refresh-title! wb)
+     (refresh-status! wb)
      ;; The find bar
      (ui/on find-entry :changed (fn [_] (show-match-count! wb (find-matches wb) nil)))
      (ui/on find-entry :activate (fn [_] (find-next! wb)))
@@ -1268,7 +1477,8 @@ shown. opts: :size [width height]."
      (ui/on window :close-request (fn [e] (when-not (may-quit? wb) (ui/veto e))))
      (ui/on window :resize (fn [_] (schedule-session-save! wb)))
      (ui/on window :closed (fn [_] (stop-watching! wb) (stop-program! wb) (save-session! wb)
-                             (ui/destroy! popup)))
+                             (ui/destroy! popup)
+                             (swap! st assoc :closed true)))
      wb)))
 
 (defn restore-session!

@@ -142,7 +142,15 @@ called with a line for each step. Returns {:ok true}, or {:ok false :step s :rea
                         (cond (on-ui (fn [] (condition-met? w what arg opts))) nil
                               (>= n (* 10 secs))
                               (error (str "waited " secs " s; the status bar says "
-                                          (pr-str (on-ui (fn [] (:text (:message w)))))))
+                                          (pr-str (on-ui (fn [] (:text (:message w)))))
+                                          ;; for an agent's step, how the chat ends
+                                          (when (and (:panel opts)
+                                                     (string/starts-with? (name what) "agent"))
+                                            (let [t (on-ui (fn [] (panel/chat-text
+                                                                   (:panel opts))))]
+                                              (str "; the chat ends: "
+                                                   (pr-str (subs t (max 0 (- (count t)
+                                                                               400)))))))))
                               :else (do (pump) (recur (inc n))))))
                     (do (when (= :agent (first step))
                           ;; built here, on the script's fiber, not the UI's thread
